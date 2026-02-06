@@ -1,0 +1,8 @@
+# Example Object
+- type: urdf
+  path: "cube.urdf" 
+  name: target_cube
+  size: 0.05
+  center: (0.4, 0.0, 0.025)
+  orientation: (0, 0, 0)
+  on_table: true

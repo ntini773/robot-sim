@@ -384,13 +384,13 @@ class RRTConnect:
         return True
 
 
-def execute_planned_path(robot, path, steps_per_segment=10, 
+def execute_planned_path(robot, path, joint_step_size=0.05, 
                          capture_frames=True, iter_folder=None,
                          frame_counter=None, base_pos=None,
                          state_history=None, cube_id=None,
                          cube_pos_history=None, table_id=None,
                          plane_id=None, tray_id=None, EXCLUDE_TABLE=True):
-    """Interpolate and execute a sequence of joint waypoints."""
+    """Interpolate and execute a sequence of joint waypoints with constant velocity."""
     if path is None:
         print("Error: No path to execute")
         return
@@ -399,8 +399,12 @@ def execute_planned_path(robot, path, steps_per_segment=10,
         q_start = np.array(path[i])
         q_end = np.array(path[i+1])
         
-        for j in range(steps_per_segment):
-            alpha = (j + 1) / steps_per_segment
+        # Calculate steps based on the maximum joint displacement to ensure constant velocity
+        dist = np.linalg.norm(q_end - q_start, ord=np.inf)
+        num_steps = max(1, int(dist / joint_step_size))
+        
+        for j in range(num_steps):
+            alpha = (j + 1) / num_steps
             q_interp = q_start + alpha * (q_end - q_start)
             
             robot.set_arm_joints(q_interp)
@@ -426,25 +430,24 @@ def execute_planned_path(robot, path, steps_per_segment=10,
             )
 
 
-def interpolate_gripper(robot, target_angle, steps=60, 
+def interpolate_gripper(robot, target_angle, gripper_step_size=0.01, 
                         capture_frames=True, iter_folder=None,
                         frame_counter=None, base_pos=None,
                         state_history=None, cube_id=None,
                         cube_pos_history=None, table_id=None,
                         plane_id=None, tray_id=None, EXCLUDE_TABLE=True):
-    """Smoothly interpolate gripper position over multiple steps"""
+    """Smoothly interpolate gripper position over multiple steps with constant velocity"""
 
     current_gripper_state = p.getJointState(robot.id, robot.mimic_parent_id)
     current_angle = current_gripper_state[0]
 
-    # print(f"\nInterpolating gripper from {current_angle:.4f} to {target_angle:.4f}")
+    # Calculate steps based on angular distance
+    num_steps = max(1, int(abs(target_angle - current_angle) / gripper_step_size))
 
     # Interpolate between current and target angle
-    for i in range(steps):
-        alpha = (i + 1) / steps  # Linear interpolation factor
+    for i in range(num_steps):
+        alpha = (i + 1) / num_steps  # Linear interpolation factor
         interpolated_angle = current_angle + alpha * (target_angle - current_angle)
-        
-        # print(f"Step {i+1}/{steps}: Target {interpolated_angle:.4f}", end=" -> ")
         
         # Control parent joint
         p.setJointMotorControl2(
@@ -1000,10 +1003,9 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             )
         else:
             print("  Planning failed! Falling back to linear IK move.")
-            robot.set_arm_joints(q_goal)
-            update_simulation(
-                100, capture_frames=True, iter_folder=temp_folder,
-                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+            execute_planned_path(
+                robot, [q_start, q_goal], capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
                 state_history=state_history, cube_id=cube_id,
                 cube_pos_history=cube_pos_history, table_id=table_id,
                 plane_id=plane_id, tray_id=tray_id,
@@ -1030,10 +1032,9 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             )
         else:
             print("  Planning failed! Falling back to linear IK move.")
-            robot.set_arm_joints(q_goal)
-            update_simulation(
-                100, capture_frames=True, iter_folder=temp_folder,
-                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+            execute_planned_path(
+                robot, [q_start, q_goal], capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
                 state_history=state_history, cube_id=cube_id,
                 cube_pos_history=cube_pos_history, table_id=table_id,
                 plane_id=plane_id, tray_id=tray_id,
@@ -1043,7 +1044,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         # Phase 3: Close gripper
         print("Phase 3: Closing gripper...")
         interpolate_gripper(
-            robot, target_angle=0.50, steps=50,
+            robot, target_angle=0.50,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -1072,10 +1073,9 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             )
         else:
             print("  Planning failed! Falling back to linear IK move.")
-            robot.set_arm_joints(q_goal)
-            update_simulation(
-                100, capture_frames=True, iter_folder=temp_folder,
-                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+            execute_planned_path(
+                robot, [q_start, q_goal], capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
                 state_history=state_history, cube_id=cube_id,
                 cube_pos_history=cube_pos_history, table_id=table_id,
                 plane_id=plane_id, tray_id=tray_id,
@@ -1105,10 +1105,9 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             )
         else:
             print("  Planning failed! Falling back to linear IK move.")
-            robot.set_arm_joints(q_goal)
-            update_simulation(
-                150, capture_frames=True, iter_folder=temp_folder,
-                frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+            execute_planned_path(
+                robot, [q_start, q_goal], capture_frames=True, iter_folder=temp_folder,
+                frame_counter=frame_counter, base_pos=robot.base_pos,
                 state_history=state_history, cube_id=cube_id,
                 cube_pos_history=cube_pos_history, table_id=table_id,
                 plane_id=plane_id, tray_id=tray_id,
@@ -1118,7 +1117,7 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         # Phase 6: Open gripper to release
         print("Phase 6: Opening gripper to release...")
         interpolate_gripper(
-            robot, target_angle=0.2, steps=20,
+            robot, target_angle=0.2,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
