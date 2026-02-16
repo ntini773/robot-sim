@@ -1,3 +1,0 @@
-"""
-PyBullet ArticuBot package.
-"""

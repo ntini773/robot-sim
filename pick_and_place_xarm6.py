@@ -8,27 +8,54 @@ from collections import namedtuple
 import cv2
 import numpy as np
 import json
+import fpsample
+
+CUBE_LENGTH = 0.05
+
+def create_cylinder(radius, height, pos, color=[0.7, 0.7, 0.7, 1]):
+    """Creates a cylinder body using primitives."""
+    visual_shape = p.createVisualShape(
+        p.GEOM_CYLINDER,
+        radius=radius,
+        length=height,
+        rgbaColor=color
+    )
+    collision_shape = p.createCollisionShape(
+        p.GEOM_CYLINDER,
+        radius=radius,
+        height=height
+    )
+    body_id = p.createMultiBody(
+        baseMass=0,  # Static object
+        baseCollisionShapeIndex=collision_shape,
+        baseVisualShapeIndex=visual_shape,
+        basePosition=[pos[0], pos[1], pos[2] + height/2] # Center vertically
+    )
+    return body_id
 
 
-class UR5Robotiq85:
+class XArm6Robotiq85:
     def __init__(self, pos, ori):
         self.base_pos = pos
         self.base_ori = p.getQuaternionFromEuler(ori)
-        self.eef_id = 7
+        # link_eef index: joint_eef is joint index 6, so link_eef = link index 6
+        # (no world link, so link_base is root at index -1)
+        self.eef_id = 6
         self.arm_num_dofs = 6
-        self.arm_rest_poses = [-1.57, -1.54, 1.34, -1.37, -1.57, 0.0]
+        self.arm_rest_poses = [0.0, -1.57, 1.57, 0.0, 0.0, 0.0]
         self.gripper_range = [0, 0.085]
         self.max_velocity = 3
 
     def load(self):
         self.id = p.loadURDF(
-            "./urdf/ur5_robotiq_85.urdf",
+            "./urdf/xarm6_robotiq_85.urdf",
             self.base_pos,
             self.base_ori,
             useFixedBase=True,
         )
         self.__parse_joint_info__()
         self.__setup_mimic_joints__()
+        self.__print_debug_info__()
 
     def __parse_joint_info__(self):
         jointInfo = namedtuple(
@@ -91,20 +118,20 @@ class UR5Robotiq85:
             "left_inner_finger_joint": -1,
             "right_inner_finger_joint": -1,
         }
-        
+
         # Find parent joint ID
         self.mimic_parent_id = [
             joint.id for joint in self.joints if joint.name == mimic_parent_name
         ][0]
-        
+
         # Store child joint info
         self.mimic_child_multiplier = {
             joint.id: mimic_children_names[joint.name]
             for joint in self.joints
             if joint.name in mimic_children_names
         }
-        
-        # Create constraints with MUCH stronger force
+
+        # Create constraints with strong force
         for joint_id, multiplier in self.mimic_child_multiplier.items():
             c = p.createConstraint(
                 self.id,
@@ -116,8 +143,40 @@ class UR5Robotiq85:
                 parentFramePosition=[0, 0, 0],
                 childFramePosition=[0, 0, 0],
             )
-            # CRITICAL: High maxForce and erp=1 for stiff constraints
+            # High maxForce and erp=1 for stiff constraints
             p.changeConstraint(c, gearRatio=-multiplier, maxForce=100000, erp=1)
+
+        # Increase friction for gripper pads to improve grasp
+        gripper_links = [self.mimic_parent_id] + list(self.mimic_child_multiplier.keys())
+        for link_id in gripper_links:
+            p.changeDynamics(
+                self.id,
+                link_id,
+                lateralFriction=5.0,
+                spinningFriction=5.0,
+                rollingFriction=5.0,
+            )
+
+    def __print_debug_info__(self):
+        """Print debug info about joint mapping and eef position"""
+        print("\n" + "="*60)
+        print("ROBOT DEBUG INFO")
+        print("="*60)
+        jtype_names = {0: 'REVOLUTE', 1: 'PRISMATIC', 4: 'FIXED'}
+        for j in self.joints:
+            jtype = jtype_names.get(j.type, str(j.type))
+            ctrl = "CTRL" if j.controllable else "    "
+            print(f"  Joint {j.id:2d}: {j.name:<35s} ({jtype:<9s}) [{ctrl}]")
+        print(f"\nArm controllable joints: {self.arm_controllable_joints}")
+        print(f"Arm lower limits: {self.arm_lower_limits}")
+        print(f"Arm upper limits: {self.arm_upper_limits}")
+        print(f"EEF link index: {self.eef_id}")
+        eef_state = p.getLinkState(self.id, self.eef_id)
+        print(f"EEF position: {eef_state[0]}")
+        print(f"EEF orientation (quat): {eef_state[1]}")
+        print(f"Mimic parent (finger_joint) ID: {self.mimic_parent_id}")
+        print(f"Mimic children: {self.mimic_child_multiplier}")
+        print("="*60 + "\n")
 
     def move_arm_ik(self, target_pos, target_orn):
         joint_poses = p.calculateInverseKinematics(
@@ -129,6 +188,8 @@ class UR5Robotiq85:
             upperLimits=self.arm_upper_limits,
             jointRanges=self.arm_joint_ranges,
             restPoses=self.arm_rest_poses,
+            maxNumIterations=100,
+            residualThreshold=1e-5
         )
         for i, joint_id in enumerate(self.arm_controllable_joints):
             p.setJointMotorControl2(
@@ -142,115 +203,113 @@ class UR5Robotiq85:
     def move_gripper(self, open_angle):
         """
         Move gripper to target angle.
-        
+
         Args:
             open_angle: Target angle for finger_joint (0 = open, 0.8 = closed)
         """
-        # Control the parent joint AND all mimic children explicitly
-        # p.setJointMotorControl2(
-        #     self.id, 
-        #     self.mimic_parent_id, 
-        #     p.POSITION_CONTROL, 
-        #     targetPosition=open_angle,
-        #     force=500,
-        #     maxVelocity=1.0
-        # )
-        
-        # # Also control mimic children to help stabilize
-        # for joint_id, multiplier in self.mimic_child_multiplier.items():
-        #     target = open_angle * multiplier
-        #     p.setJointMotorControl2(
-        #         self.id,
-        #         joint_id,
-        #         p.POSITION_CONTROL,
-        #         targetPosition=target,
-        #         force=500,
-        #         maxVelocity=1.0
-        #     )
-        
         p.resetJointState(self.id, self.mimic_parent_id, open_angle)
 
         for joint_id, multiplier in self.mimic_child_multiplier.items():
             p.resetJointState(self.id, joint_id, open_angle * multiplier)
 
+        for _ in range(10):
+            p.stepSimulation()
+
+    def reset_posture(self):
+        """Robustly reset the robot to the initial pose and gripper open."""
+        # Initial reset posture [125.0, 10.0, 177.0, 3.14, 0.0, 0.0]
+        initial_pos_world = [0.125, 0.01, 0.62 + 0.377]
+        initial_orn_world = p.getQuaternionFromEuler([3.14, 0, 0])
+
+        # Reset joints to rest_poses FIRST so IK always starts from the same
+        # seed and produces a deterministic solution regardless of the robot's
+        # current configuration.
+        for i, joint_id in enumerate(self.arm_controllable_joints):
+            p.resetJointState(self.id, joint_id, self.arm_rest_poses[i], targetVelocity=0)
+
+        target_joint_positions = p.calculateInverseKinematics(
+            self.id,
+            self.eef_id,
+            initial_pos_world,
+            initial_orn_world,
+            lowerLimits=self.arm_lower_limits,
+            upperLimits=self.arm_upper_limits,
+            jointRanges=self.arm_joint_ranges,
+            restPoses=self.arm_rest_poses,
+        )
+
+        # Disable motor control during teleport to avoid fighting
+        for j in range(p.getNumJoints(self.id)):
+            p.setJointMotorControl2(self.id, j, p.VELOCITY_CONTROL, force=0)
+
+        for i, joint_id in enumerate(self.arm_controllable_joints):
+            p.resetJointState(self.id, joint_id, target_joint_positions[i], targetVelocity=0)
+            p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, targetPosition=target_joint_positions[i], force=1000)
+
+        # Reset gripper joints to open (0.0)
+        p.resetJointState(self.id, self.mimic_parent_id, 0.0, targetVelocity=0)
+        p.setJointMotorControl2(self.id, self.mimic_parent_id, p.POSITION_CONTROL, targetPosition=0.0, force=500)
+        
+        for joint_id, multiplier in self.mimic_child_multiplier.items():
+            p.resetJointState(self.id, joint_id, 0.0, targetVelocity=0)
+            p.setJointMotorControl2(self.id, joint_id, p.POSITION_CONTROL, targetPosition=0.0, force=500)
+
+        # Settle physics
+        for _ in range(100):
+            p.stepSimulation()
 
     def get_current_ee_position(self):
         eef_state = p.getLinkState(self.id, self.eef_id)
-        return eef_state
+        return eef_state[0], eef_state[1]
 
     def get_robot_state(self):
-        """Get complete robot state: end-effector pose + joint angles"""
-        eef_state = p.getLinkState(self.id, self.eef_id)
-        eef_pos = np.array(eef_state[0])
-        eef_orn_quat = np.array(eef_state[1])
-        eef_orn_euler = np.array(p.getEulerFromQuaternion(eef_orn_quat))
+        """Get robot state: 6 arm joints + 1 gripper normalized [0, 1]"""
+        joint_states = [p.getJointState(self.id, i)[0] for i in self.arm_controllable_joints]
 
-        joint_states = []
-        for joint_id in self.arm_controllable_joints:
-            joint_state = p.getJointState(self.id, joint_id)
-            joint_states.append(joint_state[0])
+        # Get raw gripper angle
+        raw_gripper_angle = p.getJointState(self.id, self.mimic_parent_id)[0]
 
-        gripper_state = p.getJointState(self.id, self.mimic_parent_id)
-        gripper_angle = gripper_state[0]
+        # Apply noise threshold
+        if abs(raw_gripper_angle) < 1e-3:
+            raw_gripper_angle = 0.0
 
-        # 1. Apply threshold: if less than 1e-3, set to 0
-        if abs(gripper_angle) < 1e-3:
-            gripper_angle = 0.0
+        # Cap at 0.35 and Normalize to [0, 1]
+        normalized_gripper = min(raw_gripper_angle, 0.35) / 0.35
 
-
-        print(f"Gripper angle : {gripper_angle}")
-        state = np.concatenate([eef_pos, eef_orn_euler, joint_states, [gripper_angle]])
+        # Return only joint angles + gripper (7 dimensions)
+        state = np.concatenate([joint_states, [normalized_gripper]])
         return state
-    
 
 
-def interpolate_gripper(robot, target_angle, steps=60, 
+def interpolate_gripper(robot, target_angle,
                         capture_frames=True, iter_folder=None,
                         frame_counter=None, base_pos=None,
                         state_history=None, cube_id=None,
                         cube_pos_history=None, table_id=None,
                         plane_id=None, tray_id=None, EXCLUDE_TABLE=True):
-    """Smoothly interpolate gripper position over multiple steps"""
+    """Command gripper to target angle until it reaches threshold"""
 
-    current_gripper_state = p.getJointState(robot.id, robot.mimic_parent_id)
-    current_angle = current_gripper_state[0]
-
-    print(f"\nInterpolating gripper from {current_angle:.4f} to {target_angle:.4f}")
-
-    # Interpolate between current and target angle
-    for i in range(steps):
-        alpha = (i + 1) / steps  # Linear interpolation factor
-        interpolated_angle = current_angle + alpha * (target_angle - current_angle)
-        
-        print(f"Step {i+1}/{steps}: Target {interpolated_angle:.4f}", end=" -> ")
-        
+    max_iters = 100  # Safety timeout
+    for _ in range(max_iters):
         # Control parent joint
         p.setJointMotorControl2(
-            robot.id, 
-            robot.mimic_parent_id, 
-            p.POSITION_CONTROL, 
-            targetPosition=interpolated_angle,
-            force=1500,
-            maxVelocity=1.5
+            robot.id,
+            robot.mimic_parent_id,
+            p.POSITION_CONTROL,
+            targetPosition=target_angle,
+            force=500,
         )
-        
 
-        # CRITICAL: Also control all mimic children joints explicitly
+        # Also control all mimic children joints explicitly
         for joint_id, multiplier in robot.mimic_child_multiplier.items():
-            child_target = interpolated_angle * multiplier
+            child_target = target_angle * multiplier
             p.setJointMotorControl2(
                 robot.id,
                 joint_id,
                 p.POSITION_CONTROL,
                 targetPosition=child_target,
-                force=1500,
-                maxVelocity=1.0
+                force=500,
             )
-        
-        # Step simulation - use moderate number of steps
-        for _ in range(50):
-            p.stepSimulation()
-
 
         update_simulation(
             1,
@@ -267,11 +326,21 @@ def interpolate_gripper(robot, target_angle, steps=60,
             tray_id=tray_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
-    
+
+        current_gripper_state = p.getJointState(robot.id, robot.mimic_parent_id)
+        current_angle = current_gripper_state[0]
+
+        # Stopping condition
+        if target_angle > 0.36:  # Closing
+            if current_angle > 0.36:
+                break
+        else:  # Opening
+            if current_angle <= target_angle + 0.01:
+                break
+
     final_angle = p.getJointState(robot.id, robot.mimic_parent_id)[0]
     print(f"Final gripper position: {final_angle:.4f} (target was {target_angle:.4f})")
     print(f"Error: {abs(final_angle - target_angle):.4f}")
-
 
 
 def create_data_folders(iter_folder):
@@ -280,22 +349,12 @@ def create_data_folders(iter_folder):
     tp_pcd_dir = os.path.join(iter_folder, "third_person", "pcd")
     tp_seg_dir = os.path.join(iter_folder, "third_person", "segmentation")
 
-    wr_rgb_dir = os.path.join(iter_folder, "wrist", "rgb")
-    wr_depth_dir = os.path.join(iter_folder, "wrist", "depth")
-    wr_pcd_dir = os.path.join(iter_folder, "wrist", "pcd")
-    wr_seg_dir = os.path.join(iter_folder, "wrist", "segmentation")
-
     poses_dir = os.path.join(iter_folder, "camera_poses")
 
     os.makedirs(tp_rgb_dir, exist_ok=True)
     os.makedirs(tp_depth_dir, exist_ok=True)
     os.makedirs(tp_pcd_dir, exist_ok=True)
     os.makedirs(tp_seg_dir, exist_ok=True)
-
-    os.makedirs(wr_rgb_dir, exist_ok=True)
-    os.makedirs(wr_depth_dir, exist_ok=True)
-    os.makedirs(wr_pcd_dir, exist_ok=True)
-    os.makedirs(wr_seg_dir, exist_ok=True)
 
     os.makedirs(poses_dir, exist_ok=True)
 
@@ -304,48 +363,65 @@ def create_data_folders(iter_folder):
         "tp_depth": tp_depth_dir,
         "tp_pcd": tp_pcd_dir,
         "tp_seg": tp_seg_dir,
-        "wr_rgb": wr_rgb_dir,
-        "wr_depth": wr_depth_dir,
-        "wr_pcd": wr_pcd_dir,
-        "wr_seg": wr_seg_dir,
         "poses": poses_dir,
     }
 
 
-def depth_to_point_cloud(depth_buffer, view_matrix, proj_matrix, width=224, height=224):
-    """Convert depth buffer to 3D point cloud"""
-    fov = 60
-    near = 0.01
-    far = 3.0
+def depth_to_point_cloud(depth_buffer, view_matrix, proj_matrix, base_pos, width=224, height=224):
+    """Convert depth buffer to 3D point cloud in robot base frame.
+    
+    Uses PyBullet's own view + projection matrices to unproject
+    depth pixels from NDC directly to world space, then to base frame.
+    """
+    # Pixel coordinates to NDC
+    u = np.arange(width)
+    v = np.arange(height)
+    u, v = np.meshgrid(u, v)
 
-    depth_img = far * near / (far - (far - near) * depth_buffer)
-    fx = fy = width / (2 * np.tan(np.radians(fov) / 2))
-    cx, cy = width / 2, height / 2
+    x_ndc = (2.0 * u / width) - 1.0
+    y_ndc = 1.0 - (2.0 * v / height)   # OpenGL: y flips (bottom = -1)
+    z_ndc = 2.0 * depth_buffer - 1.0    # depth [0,1] -> NDC [-1,1]
 
-    view_matrix_np = np.array(view_matrix).reshape(4, 4).T
+    ndc = np.stack([x_ndc, y_ndc, z_ndc, np.ones_like(z_ndc)], axis=-1).reshape(-1, 4)
 
-    u, v = np.meshgrid(np.arange(width), np.arange(height))
+    # PyBullet returns column-major (OpenGL) -> transpose to row-major
+    view_np = np.array(view_matrix).reshape(4, 4).T
+    proj_np = np.array(proj_matrix).reshape(4, 4).T
 
-    z = depth_img
-    x = -(u - cx) * z / fx
-    y = -(v - cy) * z / fy
+    # clip = Proj @ View @ world_pos  ->  world_pos = inv(Proj @ View) @ clip
+    inv_vp = np.linalg.inv(proj_np @ view_np)
 
-    points_camera = np.stack([x, y, z], axis=-1).reshape(-1, 3)
-    return points_camera
+    # Unproject NDC to world
+    world_homo = (inv_vp @ ndc.T).T
+    points_world = world_homo[:, :3] / world_homo[:, 3:4]
+
+    # World -> robot base frame
+    points_base = points_world - np.array(base_pos)
+
+    return points_base
 
 
-def get_wrist_camera_params(robot):
-    """Get wrist camera position and orientation based on end-effector"""
-    eef_state = robot.get_current_ee_position()
-    eef_pos, eef_orn = eef_state[0], eef_state[1]
+def farthest_point_sampling(points, n_samples, colors=None):
+    """Farthest Point Sampling using fpsample (Rust-backed).
+    
+    Args:
+        points: (N, 3) array of 3D points
+        n_samples: number of points to sample
+        colors: optional (N, 3) array of colors
+    
+    Returns:
+        sampled_points: (n_samples, 3) array
+        sampled_colors: (n_samples, 3) array if colors provided, else None
+    """
+    if len(points) <= n_samples:
+        return (points, colors) if colors is not None else (points, None)
+    
+    indices = fpsample.fps_npdu_sampling(points, n_samples)
+    sampled_points = points[indices]
+    sampled_colors = colors[indices] if colors is not None else None
+    return sampled_points, sampled_colors
 
-    rot_matrix = np.array(p.getMatrixFromQuaternion(eef_orn)).reshape(3, 3)
-    cam_offset_local = np.array([-0.05, 0, 0.12])
-    cam_pos = np.array(eef_pos) + rot_matrix @ cam_offset_local
-    cam_target = cam_pos + rot_matrix[:, 0] * 0.35 + rot_matrix[:, 2] * (-0.15)
-    cam_up = rot_matrix[:, 2]
 
-    return cam_pos, cam_target, cam_up
 
 
 def save_camera_pose(pose_dict, poses_dir, frame_idx):
@@ -397,29 +473,27 @@ def update_simulation(
     table_id=None,
     plane_id=None,
     tray_id=None,
-    EXCLUDE_TABLE = True,
+    EXCLUDE_TABLE=True,
 ):
     """Update simulation and capture frames with table segmentation"""
 
     if capture_frames:
         dirs = create_data_folders(iter_folder)
 
-    tp_cam_eye = [1.1, -0.6, 1.3]
-    tp_cam_target = [0.5, 0.3, 0.7]
+    # Camera pose from real-world calibration (base-to-camera transform)
+    # Translation in base frame: [0.7463, 0.3093, 0.5574]
+    # Robot base is at z=0.62 in world frame
+    tp_cam_eye = [0.7463, 0.3093, 0.62 + 0.5574]  # [0.7463, 0.3093, 1.1774]
+    # Viewing direction from 3rd column of rotation: [-0.7751, -0.4045, -0.4855]
+    tp_cam_target = [0.7463 - 0.7751, 0.3093 - 0.4045, 1.1774 - 0.4855]  # [-0.0288, -0.0952, 0.6919]
     tp_cam_up = [0, 0, 1]
 
     # Create list of object IDs to exclude from point clouds
     exclude_ids = []
     if table_id is not None and EXCLUDE_TABLE:
-        # print("Excluding table from point clouds with {}".format(table_id))
         exclude_ids.append(table_id)
     if plane_id is not None:
-        # print("Excluding plane from point clouds with {}".format(plane_id))
         exclude_ids.append(plane_id)
-
-    # if tray_id is not None:
-    #     print("Excluding tray from point clouds with {}".format(tray_id))
-    #     exclude_ids.append(tray_id)
 
     for _ in range(steps):
         p.stepSimulation()
@@ -437,8 +511,8 @@ def update_simulation(
 
             # Capture with segmentation mask
             width, height, rgb_tp, depth_tp, seg_tp = p.getCameraImage(
-                224, 224, 
-                viewMatrix=view_matrix_tp, 
+                224, 224,
+                viewMatrix=view_matrix_tp,
                 projectionMatrix=proj_matrix,
                 flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX
             )
@@ -446,15 +520,28 @@ def update_simulation(
             rgb_tp = np.array(rgb_tp)[:, :, :3]
             depth_buffer_tp = np.array(depth_tp)
             seg_tp = np.array(seg_tp)
-            
+
             # Create mask for objects to exclude
             exclude_mask_tp = np.zeros_like(seg_tp, dtype=bool)
             for obj_id in exclude_ids:
                 exclude_mask_tp |= (seg_tp == obj_id)
-            
+
+            # Filter out far-plane (background/sky) pixels
+            background_mask = (depth_buffer_tp >= 0.9999).flatten()
+
             point_cloud_tp = depth_to_point_cloud(
-                depth_buffer_tp, view_matrix_tp, proj_matrix
+                depth_buffer_tp, view_matrix_tp, proj_matrix, base_pos
             )
+
+            # --- APPLY FILTERS TO NPY DATA ---
+            points_tp_flat = point_cloud_tp.reshape(-1, 3)
+            valid_mask_tp = points_tp_flat[:, 2] < 2.5
+            exclude_mask_flat_tp = exclude_mask_tp.flatten()
+            final_mask_tp = valid_mask_tp & (~exclude_mask_flat_tp) & (~background_mask)
+            filtered_pcd_tp = points_tp_flat[final_mask_tp]
+
+            # Apply Farthest Point Sampling to get 2500 points
+            filtered_pcd_tp, _ = farthest_point_sampling(filtered_pcd_tp, 2500)
 
             # Save third-person data
             cv2.imwrite(
@@ -467,80 +554,28 @@ def update_simulation(
             )
             np.save(
                 os.path.join(dirs["tp_pcd"], f"tp_pcd_{frame_counter[0]:04d}.npy"),
-                point_cloud_tp,
+                filtered_pcd_tp,
             )
             np.save(
                 os.path.join(dirs["tp_seg"], f"tp_seg_{frame_counter[0]:04d}.npy"),
                 seg_tp,
             )
 
-            # Save PLY with table removed
+            # Save PLY with table and background removed + FPS
             colors_tp = rgb_tp.reshape(-1, 3)
             points_tp = point_cloud_tp.reshape(-1, 3)
-            exclude_mask_flat_tp = exclude_mask_tp.flatten()
-            
+            exclude_mask_flat_tp = exclude_mask_tp.flatten() | background_mask
+            valid_ply = (~exclude_mask_flat_tp) & (points_tp[:, 2] < 2.5)
+            ply_points = points_tp[valid_ply]
+            ply_colors = colors_tp[valid_ply]
+
+            # Apply FPS to PLY as well
+            ply_points, ply_colors = farthest_point_sampling(ply_points, 2500, ply_colors)
+
             ply_path_tp = os.path.join(
                 dirs["tp_pcd"], f"tp_pcd_{frame_counter[0]:04d}.ply"
             )
-            save_point_cloud_ply(points_tp, colors_tp, ply_path_tp, exclude_mask_flat_tp)
-
-            # ============ WRIST CAMERA ============
-            wr_cam_pos, wr_cam_target, wr_cam_up = get_wrist_camera_params(robot)
-
-            view_matrix_wr = p.computeViewMatrix(
-                cameraEyePosition=wr_cam_pos,
-                cameraTargetPosition=wr_cam_target,
-                cameraUpVector=wr_cam_up,
-            )
-
-            # Capture with segmentation mask
-            width, height, rgb_wr, depth_wr, seg_wr = p.getCameraImage(
-                224, 224, 
-                viewMatrix=view_matrix_wr, 
-                projectionMatrix=proj_matrix,
-                flags=p.ER_SEGMENTATION_MASK_OBJECT_AND_LINKINDEX
-            )
-
-            rgb_wr = np.array(rgb_wr)[:, :, :3]
-            depth_buffer_wr = np.array(depth_wr)
-            seg_wr = np.array(seg_wr)
-            
-            # Create mask for objects to exclude
-            exclude_mask_wr = np.zeros_like(seg_wr, dtype=bool)
-            for obj_id in exclude_ids:
-                exclude_mask_wr |= (seg_wr == obj_id)
-            
-            point_cloud_wr = depth_to_point_cloud(
-                depth_buffer_wr, view_matrix_wr, proj_matrix
-            )
-
-            # Save wrist data
-            cv2.imwrite(
-                os.path.join(dirs["wr_rgb"], f"wr_rgb_{frame_counter[0]:04d}.png"),
-                cv2.cvtColor(rgb_wr, cv2.COLOR_RGB2BGR),
-            )
-            np.save(
-                os.path.join(dirs["wr_depth"], f"wr_depth_{frame_counter[0]:04d}.npy"),
-                depth_buffer_wr,
-            )
-            np.save(
-                os.path.join(dirs["wr_pcd"], f"wr_pcd_{frame_counter[0]:04d}.npy"),
-                point_cloud_wr,
-            )
-            np.save(
-                os.path.join(dirs["wr_seg"], f"wr_seg_{frame_counter[0]:04d}.npy"),
-                seg_wr,
-            )
-
-            # Save PLY with table removed
-            colors_wr = rgb_wr.reshape(-1, 3)
-            points_wr = point_cloud_wr.reshape(-1, 3)
-            exclude_mask_flat_wr = exclude_mask_wr.flatten()
-            
-            ply_path_wr = os.path.join(
-                dirs["wr_pcd"], f"wr_pcd_{frame_counter[0]:04d}.ply"
-            )
-            save_point_cloud_ply(points_wr, colors_wr, ply_path_wr, exclude_mask_flat_wr)
+            save_point_cloud_ply(ply_points, ply_colors, ply_path_tp)
 
             # ============ SAVE CAMERA POSES ============
             base_pos_array = np.array(base_pos)
@@ -551,23 +586,12 @@ def update_simulation(
                 tp_cam_pos_base, tp_cam_target_base, tp_cam_up
             )
 
-            wr_cam_pos_base = np.array(wr_cam_pos) - base_pos_array
-            wr_cam_target_base = np.array(wr_cam_target) - base_pos_array
-            wr_extrinsics = compute_extrinsics(
-                wr_cam_pos_base, wr_cam_target_base, wr_cam_up
-            )
-
             pose_dict = {
                 "frame": frame_counter[0],
                 "third_person_camera": {
                     "rotation_matrix": tp_extrinsics["rotation_matrix"],
                     "translation": tp_extrinsics["translation"],
                     "extrinsics_matrix": tp_extrinsics["extrinsics_matrix"],
-                },
-                "wrist_camera": {
-                    "rotation_matrix": wr_extrinsics["rotation_matrix"],
-                    "translation": wr_extrinsics["translation"],
-                    "extrinsics_matrix": wr_extrinsics["extrinsics_matrix"],
                 },
             }
 
@@ -589,13 +613,11 @@ def update_simulation(
 
 def save_point_cloud_ply(points, colors, filename, exclude_mask=None):
     """Save point cloud in PLY format with colors, excluding masked points"""
-    # Apply depth filter
     valid_mask = points[:, 2] < 2.5
-    
-    # Apply exclude mask if provided
+
     if exclude_mask is not None:
         valid_mask = valid_mask & (~exclude_mask)
-    
+
     points = points[valid_mask]
     colors = colors[valid_mask]
 
@@ -616,27 +638,62 @@ def save_point_cloud_ply(points, colors, filename, exclude_mask=None):
             f.write(f"{int(color[0])} {int(color[1])} {int(color[2])}\n")
 
 
+def setup_simulation(freq=240, gui=False):
 
-def setup_simulation():
-    try:
-        cid = p.connect(p.GUI)
-        print("PyBullet GUI connected")
-    except Exception:
-        cid = p.connect(p.DIRECT)
+    if gui:
+        p.connect(p.GUI)
+        print("PyBullet running in GUI mode")
+    else:
+        p.connect(p.DIRECT)
         print("PyBullet running in DIRECT (headless) mode")
 
     p.setGravity(0, 0, -9.8)
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
-    
+    p.setTimeStep(1/freq)
     plane_id = p.loadURDF("plane.urdf", [0, 0, 0], useMaximalCoordinates=True)
     table_id = p.loadURDF(
         "table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0])
     )
-    tray_pos = [0.5, 0.9, 0.6]
-    tray_orn = p.getQuaternionFromEuler([0, 0, 0])
-    tray_id = p.loadURDF("tray/tray.urdf", tray_pos, tray_orn)
-    
-    return tray_pos, tray_orn, table_id, plane_id, tray_id
+    # tray_pos = [0.25, 0.3, 0.6]
+    # tray_orn = p.getQuaternionFromEuler([0, 0, 0])
+    # # tray_id = p.loadURDF("tray/tray.urdf", tray_pos, tray_orn)
+    # tray_id = None
+
+    # return tray_pos, tray_orn, table_id, plane_id, tray_id
+
+    return None, table_id, plane_id
+
+
+def move_to_pose_dynamic(
+    robot, target_pos, target_orn,
+    max_steps=200,   # Increased default steps for better settling
+    capture_frames=False,
+    iter_folder=None,
+    frame_counter=None,
+    threshold=0.01,  # 1cm accuracy
+    **kwargs
+):
+    """
+    Move the robot to a target pose using CLOSED-LOOP control.
+    Recalculates IK targets inside the simulation loop for maximum accuracy.
+    """
+    for step in range(max_steps):
+        # 1. Recalculate IK target for current state (Closed-loop)
+        robot.move_arm_ik(target_pos, target_orn)
+        
+        # 2. Advance simulation
+        update_simulation(1, robot=robot, capture_frames=capture_frames, 
+                          iter_folder=iter_folder, frame_counter=frame_counter, **kwargs)
+
+        # 3. Check if target reached
+        current_pos, current_orn = robot.get_current_ee_position()
+        dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+        if dist < threshold:
+            # print(f"  Reached target in {step+1} steps.")
+            return True
+
+    print(f"  -> Warning: Did not reach target within {max_steps} steps. Final error: {dist:.4f}m")
+    return False
 
 
 def random_color_cube(cube_id):
@@ -644,81 +701,75 @@ def random_color_cube(cube_id):
     p.changeVisualShape(cube_id, -1, rgbaColor=color)
 
 
-def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TABLE, base_save_dir="dataset"):
+def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="dataset"):
     successful_iterations = 0
     total_attempts = 0
     failed_attempts = 0
-    
+
     print("\n" + "="*60)
     print("STARTING DATA COLLECTION")
-    print(f"Target: 36 successful trajectories")
+    print(f"Target: 150 successful trajectories")
     print("="*60 + "\n")
 
-    while successful_iterations < 5:
+    # PRIME THE ROBOT: Reset once before the first attempt starts
+    # This ensures ATTEMPT 1 starts at the same pose as all others.
+    print("Priming robot for collection...")
+    robot.reset_posture()
+
+    cube_id = None
+    cylinder_id = None
+    while successful_iterations < 150:
         # Create temp folder for this attempt
         temp_folder = os.path.join(base_save_dir, f"temp_iter_{total_attempts:04d}")
         os.makedirs(temp_folder, exist_ok=True)
+
+        # Clean up previous cube
+        if cube_id is not None:
+            try:
+                p.removeBody(cube_id)
+            except:
+                pass
+        cube_id = None
+
+        # Clean up previous cylinder
+        if cylinder_id is not None:
+            try:
+                p.removeBody(cylinder_id)
+            except:
+                pass
+        cylinder_id = None
+
+        # Spawn cylinder at a random position on the table for this trajectory
+        target_radius = 0.05  # 10cm diameter
+        target_height = 0.04  # 4cm height
+        tray_pos = [random.uniform(0.20, 0.35), random.uniform(0.15, 0.25), 0.625]
+        cylinder_id = create_cylinder(target_radius, target_height, tray_pos, color=[1, 0.5, 0, 1])
+        print(f"Cylinder spawned at: [{tray_pos[0]:.4f}, {tray_pos[1]:.4f}, {tray_pos[2]:.4f}]")
 
         frame_counter = [0]
         state_history = []
         cube_pos_history = []
 
         print(f"\n{'='*60}")
-        print(f"ATTEMPT {total_attempts + 1} (Successful: {successful_iterations}/36)")
+        print(f"ATTEMPT {total_attempts + 1} (Successful: {successful_iterations}/150)")
         print(f"{'='*60}\n")
 
-        # Reset arm posture
-        target_joint_positions = [0, -1.57, 1.57, -1.5, -1.57, 0.0]
-        for i, joint_id in enumerate(robot.arm_controllable_joints):
-            p.setJointMotorControl2(
-                robot.id, joint_id, p.POSITION_CONTROL, target_joint_positions[i]
-            )
-
-        # Force gripper to reset
-        print("Resetting gripper...")
-
-        p.resetJointState(robot.id, robot.mimic_parent_id, 0)
-        for joint_id, multiplier in robot.mimic_child_multiplier.items():
-            p.resetJointState(robot.id, joint_id, 0)
-    
-        p.setJointMotorControl2(
-            robot.id, 
-            robot.mimic_parent_id, 
-            p.POSITION_CONTROL, 
-            targetPosition=0.000,
-            force=1500,
-            maxVelocity=1.5
-        )
-
-        
-        for _ in range(5000):
-            p.stepSimulation()
+        # Robust Reset: Teleport instantly and reset velocities
+        print("Resetting robot posture and gripper...")
+        robot.reset_posture()
 
         actual_angle = p.getJointState(robot.id, robot.mimic_parent_id)[0]
-        
-        update_simulation(
-            200,
-            capture_frames=False,
-            iter_folder=temp_folder,
-            frame_counter=frame_counter,
-            robot=robot,
-            base_pos=robot.base_pos,
-            state_history=state_history,
-            table_id=table_id,
-            plane_id=plane_id,
-            tray_id=tray_id,
-            EXCLUDE_TABLE=EXCLUDE_TABLE,
-        )
-
-        print(f"Gripper reset to: {actual_angle:.4f}\n")
-
+        print(f"Robot reset complete. Gripper angle: {actual_angle:.4f}\n")
 
         # Spawn random cube
-        cube_start_pos = [random.uniform(0.3, 0.7), random.uniform(-0.1, 0.1), 0.65]
+        cube_start_pos = [random.uniform(0.15, 0.35), random.uniform(-0.2, 0.1), 0.65]
         cube_start_orn = p.getQuaternionFromEuler([0, 0, 0])
         cube_id = p.loadURDF("cube_small.urdf", cube_start_pos, cube_start_orn)
-        random_color_cube(cube_id)
-        
+        # Increase friction of the cube itself
+        p.changeDynamics(cube_id, -1, lateralFriction=5.0, spinningFriction=5, rollingFriction=5)
+        # Cube color: Black
+        p.changeVisualShape(cube_id, -1, rgbaColor=[0, 0, 0, 1])
+
         print(f"Cube spawned at: [{cube_start_pos[0]:.4f}, {cube_start_pos[1]:.4f}, {cube_start_pos[2]:.4f}]")
 
         eef_state = robot.get_current_ee_position()
@@ -726,136 +777,194 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
 
         # Phase 1: Move above cube
         print("Phase 1: Moving above cube...")
-        robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 0.83], eef_orientation)
-        update_simulation(
-            50, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+        move_to_pose_dynamic(
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.85], eef_orientation,
+            capture_frames=True, iter_folder=temp_folder,
+            frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
             cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
+            plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
         # Phase 2: Move down to grasp
         print("Phase 2: Moving down to grasp...")
-        robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 0.78], eef_orientation)
-        update_simulation(
-            50, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+        move_to_pose_dynamic(
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.78], eef_orientation,
+            capture_frames=True, iter_folder=temp_folder,
+            frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
             cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
+            plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
         # Phase 3: Close gripper
         print("Phase 3: Closing gripper...")
         interpolate_gripper(
-            robot, target_angle=0.4, steps=50,
+            robot, target_angle=0.5,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
             cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
+            plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
         # Phase 4: Lift cube
         print("Phase 4: Lifting cube...")
-        robot.move_arm_ik([cube_start_pos[0], cube_start_pos[1], 1.18], eef_orientation)
-        update_simulation(
-            50, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+        move_to_pose_dynamic(
+            robot, [cube_start_pos[0], cube_start_pos[1], 1.00], eef_orientation,
+            capture_frames=True, iter_folder=temp_folder,
+            frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
             cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
-            EXCLUDE_TABLE=EXCLUDE_TABLE 
+            plane_id=plane_id, tray_id=cylinder_id,
+            EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
-        # Phase 5: Move above tray
-        print("Phase 5: Moving to tray...")
-        tray_offset = random.uniform(0.1, 0.3)
-        target_tray_pos = [tray_pos[0] + tray_offset, tray_pos[1] + tray_offset, tray_pos[2] + 0.56]
-        print(f"  Target position: [{target_tray_pos[0]:.4f}, {target_tray_pos[1]:.4f}, {target_tray_pos[2]:.4f}]")
-        
-        robot.move_arm_ik(target_tray_pos, eef_orientation)
-        update_simulation(
-            150, capture_frames=True, iter_folder=temp_folder,
-            frame_counter=frame_counter, robot=robot, base_pos=robot.base_pos,
+        # Phase 5: Move above cylinder
+        print("Phase 5: Moving above cylinder target...")
+        # Target the top of the cylinder [0.3, 0.3, 0.625 + 0.04] + half cube height [0.025] + safety margin
+        cylinder_height = 0.04
+        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.15]
+        print(f"  Target position: [{target_drop_pos[0]:.4f}, {target_drop_pos[1]:.4f}, {target_drop_pos[2]:.4f}]")
+
+        move_to_pose_dynamic(
+            robot, target_drop_pos, eef_orientation,
+            capture_frames=True, iter_folder=temp_folder,
+            frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
             cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
+            plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
         # Phase 6: Open gripper to release
         print("Phase 6: Opening gripper to release...")
         interpolate_gripper(
-            robot, target_angle=0.2, steps=20,
+            robot, target_angle=0.0,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
             cube_pos_history=cube_pos_history, table_id=table_id,
-            plane_id=plane_id, tray_id=tray_id,
+            plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
 
         # Phase 7: Wait for cube to settle
         print("Phase 7: Waiting for cube to settle...")
-        for _ in range(1500):
+        for _ in range(500):
             p.stepSimulation()
 
         # ============ CHECK SUCCESS ============
-        cube_min, cube_max = p.getAABB(cube_id)
-        tray_min, tray_max = p.getAABB(tray_id)
-
-        margin = 0.02
-        inside_tray = (
-            cube_min[0] > tray_min[0] + margin and cube_max[0] < tray_max[0] - margin and
-            cube_min[1] > tray_min[1] + margin and cube_max[1] < tray_max[1] - margin and
-            cube_min[2] > tray_min[2] and cube_max[2] < tray_max[2] + 0.1
-        )
+        # Cylinder Top Success: Cube centered on cylinder and resting on its surface
+        cube_final_pos = p.getBasePositionAndOrientation(cube_id)[0]
+        dist_to_center = np.linalg.norm(np.array(cube_final_pos[:2]) - np.array(tray_pos[:2]))
+        
+        cylinder_height = 0.04
+        cylinder_radius = 0.05
+        cylinder_top_z = tray_pos[2] + cylinder_height
+        
+        # Success if cube is on cylinder (dist < radius) and high enough (z > cylinder_top)
+        # Cube center should be at cylinder_top_z + CUBE_LENGTH/2 = 0.665 + 0.025 = 0.69
+        inside_tray = dist_to_center < cylinder_radius and cube_final_pos[2] > cylinder_top_z + 0.01
 
         cube_final_pos = p.getBasePositionAndOrientation(cube_id)[0]
-        
+
         if inside_tray:
             print(f"\n{'='*60}")
-            print(f"🎉 SUCCESS! Cube in tray at {cube_final_pos}")
+            print(f"🎉 SUCCESS! Cube on cylinder at {cube_final_pos}")
             print(f"{'='*60}\n")
-            
+
             # Save this successful trajectory
             final_folder = os.path.join(base_save_dir, f"iter_{successful_iterations:04d}")
-            
+
             # Rename temp folder to final folder
             if os.path.exists(final_folder):
                 import shutil
                 shutil.rmtree(final_folder)
             os.rename(temp_folder, final_folder)
-            
+
             # Save state-action data
             agent_pos = np.array(state_history)
-            actions = np.diff(agent_pos, axis=0)
-            actions = np.vstack([actions, np.zeros(13)])
+
+            # Create "Next State" actions (Absolute positions)
+            actions = np.zeros_like(agent_pos)
+            if len(agent_pos) > 1:
+                actions[:-1] = agent_pos[1:]
+                actions[-1] = agent_pos[-1]
+
+            # --- FILTERING: Remove static frames ---
+            deltas = actions - agent_pos
+            dists = np.linalg.norm(deltas, axis=1)
+
+            keep_mask = dists >= 0.008
+
+            if len(keep_mask) > 0:
+                keep_mask[-1] = True
+
+            original_count = len(agent_pos)
+            agent_pos = agent_pos[keep_mask]
+            actions = actions[keep_mask]
+
             cube_positions = np.array(cube_pos_history)
+            if len(cube_positions) == original_count:
+                cube_positions = cube_positions[keep_mask]
+
+            print(f"  Filtered static frames: {original_count} -> {len(agent_pos)} (Removed {original_count - len(agent_pos)})")
+
+            # --- PRUNE image/pcd/depth/seg/pose files to match filtered states ---
+            removed_indices = set(np.where(~keep_mask)[0])
+            if removed_indices:
+                prune_dirs = {
+                    "tp_rgb":   (os.path.join(final_folder, "third_person", "rgb"),   "tp_rgb_{:04d}.png"),
+                    "tp_depth": (os.path.join(final_folder, "third_person", "depth"), "tp_depth_{:04d}.npy"),
+                    "tp_pcd":   (os.path.join(final_folder, "third_person", "pcd"),   "tp_pcd_{:04d}.npy"),
+                    "tp_ply":   (os.path.join(final_folder, "third_person", "pcd"),   "tp_pcd_{:04d}.ply"),
+                    "tp_seg":   (os.path.join(final_folder, "third_person", "segmentation"), "tp_seg_{:04d}.npy"),
+                    "cam_pose": (os.path.join(final_folder, "camera_poses"),          "pose_{:04d}.json"),
+                }
+                for label, (dir_path, pattern) in prune_dirs.items():
+                    if not os.path.isdir(dir_path):
+                        continue
+                    # 1) Delete removed files
+                    for idx in removed_indices:
+                        fpath = os.path.join(dir_path, pattern.format(idx))
+                        if os.path.exists(fpath):
+                            os.remove(fpath)
+                    # 2) Renumber survivors sequentially
+                    ext = pattern.split(".")[-1]
+                    prefix = pattern.split("_")[:-1]  # e.g. ["tp", "rgb"]
+                    surviving = sorted(f for f in os.listdir(dir_path) if f.endswith(f".{ext}"))
+                    for new_idx, old_name in enumerate(surviving):
+                        new_name = pattern.format(new_idx)
+                        if old_name != new_name:
+                            os.rename(
+                                os.path.join(dir_path, old_name),
+                                os.path.join(dir_path, new_name),
+                            )
+                print(f"  Pruned data files: kept {len(agent_pos)}/{original_count} frames")
+
 
             state_action_data = {
                 "agent_pos": agent_pos.tolist(),
                 "action": actions.tolist(),
                 "cube_pos": cube_positions.tolist(),
                 "num_frames": len(agent_pos),
-                "state_dim": 13,
+                "state_dim": 7,
                 "cube_dim": 7,
                 "success": True,
                 "attempt_number": total_attempts,
                 "success_number": successful_iterations,
                 "cube_start_pos": cube_start_pos,
                 "cube_final_pos": list(cube_final_pos),
+                "cylinder_pos": tray_pos,
                 "state_description": {
-                    "eef_pos": [0, 1, 2],
-                    "eef_orn": [3, 4, 5],
-                    "arm_joints": [6, 7, 8, 9, 10, 11],
-                    "gripper": [12],
+                    "arm_joints": [0, 1, 2, 3, 4, 5],
+                    "gripper": [6],
                 },
+                "action_description": "Absolute target state (next state) for each timestep",
                 "cube_description": {
                     "position": [0, 1, 2],
                     "orientation": [3, 4, 5, 6],
@@ -875,14 +984,14 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
                 agent_pos,
                 fmt="%.6f",
                 delimiter=" ",
-                header="End-effector pose (x,y,z,roll,pitch,yaw) + 6 joint angles + gripper angle (13 dimensions)",
+                header="6 joint angles + gripper angle normalized (7 dimensions)",
             )
             np.savetxt(
                 os.path.join(final_folder, "actions.txt"),
                 actions,
                 fmt="%.6f",
                 delimiter=" ",
-                header="Action deltas: differences between consecutive states (13 dimensions)",
+                header="Absolute Target States: The state reached at t+1 (7 dimensions)",
             )
             np.savetxt(
                 os.path.join(final_folder, "cube_pos.txt"),
@@ -897,24 +1006,27 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
             print(f"  Agent states shape: {agent_pos.shape}")
             print(f"  Actions shape: {actions.shape}")
             print(f"  Cube positions shape: {cube_positions.shape}")
-            
+
             successful_iterations += 1
-            
+
         else:
             print(f"\n{'='*60}")
-            print(f"❌ FAILED - Cube missed tray, ended at {cube_final_pos}")
+            print(f"❌ FAILED - Cube missed cylinder, ended at {cube_final_pos}")
             print(f"{'='*60}\n")
-            
+
             # Delete temp folder for failed attempt
             import shutil
             if os.path.exists(temp_folder):
                 shutil.rmtree(temp_folder)
-            
+
             failed_attempts += 1
 
-        # Remove cube
+        # Remove cube and cylinder (will be recreated next iteration)
         p.removeBody(cube_id)
-        
+        p.removeBody(cylinder_id)
+        cube_id = None
+        cylinder_id = None
+
         total_attempts += 1
 
         # Print progress
@@ -922,10 +1034,10 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
         print(f"PROGRESS UPDATE")
         print(f"{'='*60}")
         print(f"Total attempts: {total_attempts}")
-        print(f"Successful: {successful_iterations}/36 ({100*successful_iterations/36:.1f}%)")
+        print(f"Successful: {successful_iterations}/150 ({100*successful_iterations/36:.1f}%)")
         print(f"Failed: {failed_attempts}")
         print(f"Success rate: {100*successful_iterations/total_attempts:.1f}%")
-        print(f"Remaining: {36 - successful_iterations}")
+        print(f"Remaining: {150 - successful_iterations}")
         print(f"{'='*60}\n")
 
     # Final summary
@@ -939,22 +1051,20 @@ def move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id, EXCLUDE_TAB
     print("="*60 + "\n")
 
 
-
 def main():
-    
+
     EXCLUDE_TABLE = True
 
     """
     If excluding table from point clouds, set EXCLUDE_TABLE = True
-    0r else False to include table in point clouds
+    Or else False to include table in point clouds
     """
 
-    tray_pos, tray_orn, table_id, plane_id, tray_id = setup_simulation()
-    robot = UR5Robotiq85([0, 0, 0.62], [0, 0, 0])
+    _, table_id, plane_id = setup_simulation(freq=60, gui=True)
+    robot = XArm6Robotiq85([0, 0, 0.62], [0, 0, 0])
     robot.load()
-    move_and_grab_cube(robot, tray_pos, table_id, plane_id, tray_id , EXCLUDE_TABLE = EXCLUDE_TABLE)
+    move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE=EXCLUDE_TABLE)
 
 
 if __name__ == "__main__":
     main()
-
