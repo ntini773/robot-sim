@@ -232,7 +232,7 @@ def test_panda_robot():
     
     # Add obstacle box in front of robot (in workspace)
     # Position it where the robot arm might reach
-    obstacle_pos = [0.4, 0.2, 0.8]  # Front-right of robot, at arm height
+    obstacle_pos = [0.3, 0, 0.7]  # Front-right of robot, at arm height
     obstacle_size = [0.15, 0.15, 0.1]  # Width, depth, height
     
     collision_shape = p.createCollisionShape(
@@ -307,66 +307,143 @@ def test_panda_robot():
     print("- Same physics client: MUCH FASTER")
     print("="*60 + "\n")
     
-    # Test 1: Simple joint space movement
+    # ============================================
+    # Define start and goal in END-EFFECTOR SPACE (Cartesian coordinates)
+    # ============================================
     print(f"\n{'='*60}")
-    print("TEST 1: Move toward obstacle area (should avoid it)")
+    print("DEFINING START AND GOAL IN END-EFFECTOR SPACE")
     print(f"{'='*60}")
     
-    start = home_config.copy()
-    goal = home_config.copy()
-    goal[0] += 0.8  # Move first joint significantly to reach toward obstacle
-    goal[1] -= 0.3  # Lower shoulder
+    # Start position: LEFT side of obstacle
+    start_ee_pos = [0.3, -0.3, 0.8]  # x, y, z in meters
+    start_ee_orn = p.getQuaternionFromEuler([3.14, 0, 0])  # Pointing down
     
-    path = planner.plan(start, goal, planning_time=2.0)
+    # Goal position: RIGHT side of obstacle  
+    goal_ee_pos = [0.3, 0.3, 0.8]  # x, y, z in meters
+    goal_ee_orn = p.getQuaternionFromEuler([3.14, 0, 0])  # Pointing down
+    
+    print(f"Start EE position: {[f'{x:.2f}' for x in start_ee_pos]}")
+    print(f"Goal EE position:  {[f'{x:.2f}' for x in goal_ee_pos]}")
+    print(f"Obstacle at:       {[f'{x:.2f}' for x in obstacle_pos]}")
+    
+    # ============================================
+    # Use Inverse Kinematics to get joint configurations
+    # ============================================
+    print(f"\nSolving inverse kinematics...")
+    
+    # IK for start position
+    start_config = list(p.calculateInverseKinematics(
+        panda,
+        11,  # End-effector link index for Panda
+        start_ee_pos,
+        start_ee_orn,
+        maxNumIterations=100,
+        residualThreshold=1e-5
+    ))[:7]  # Take only first 7 joints (arm joints)
+    
+    # IK for goal position
+    goal_config = list(p.calculateInverseKinematics(
+        panda,
+        11,  # End-effector link index for Panda
+        goal_ee_pos,
+        goal_ee_orn,
+        maxNumIterations=100,
+        residualThreshold=1e-5
+    ))[:7]  # Take only first 7 joints (arm joints)
+    
+    print(f"✓ IK solved")
+    print(f"  Start joints: {[f'{x:.2f}' for x in start_config]}")
+    print(f"  Goal joints:  {[f'{x:.2f}' for x in goal_config]}")
+    
+    # ============================================
+    # Verify IK solutions by setting robot and checking positions
+    # ============================================
+    # Set robot to start configuration
+    for i, joint_id in enumerate(arm_joints):
+        p.resetJointState(panda, joint_id, start_config[i])
+    
+    for _ in range(50):
+        p.stepSimulation()
+    
+    # Verify start position
+    start_ee_state = p.getLinkState(panda, 11)
+    start_ee_actual = start_ee_state[0]
+    start_error = np.linalg.norm(np.array(start_ee_pos) - np.array(start_ee_actual))
+    
+    # Set to goal configuration
+    for i, joint_id in enumerate(arm_joints):
+        p.resetJointState(panda, joint_id, goal_config[i])
+    
+    for _ in range(50):
+        p.stepSimulation()
+    
+    # Verify goal position
+    goal_ee_state = p.getLinkState(panda, 11)
+    goal_ee_actual = goal_ee_state[0]
+    goal_error = np.linalg.norm(np.array(goal_ee_pos) - np.array(goal_ee_actual))
+    
+    print(f"\nIK Verification:")
+    print(f"  Start error: {start_error*1000:.2f}mm")
+    print(f"  Goal error:  {goal_error*1000:.2f}mm")
+    
+    # Reset to start position
+    for i, joint_id in enumerate(arm_joints):
+        p.resetJointState(panda, joint_id, start_config[i])
+    
+    # ============================================
+    # Create visual markers for start and goal positions
+    # ============================================
+    start_marker = p.createVisualShape(
+        p.GEOM_SPHERE,
+        radius=0.05,
+        rgbaColor=[0, 1, 0, 0.8]  # Green for start
+    )
+    goal_marker = p.createVisualShape(
+        p.GEOM_SPHERE,
+        radius=0.05,
+        rgbaColor=[0, 0, 1, 0.8]  # Blue for goal
+    )
+    
+    p.createMultiBody(
+        baseMass=0,
+        baseVisualShapeIndex=start_marker,
+        basePosition=start_ee_pos
+    )
+    p.createMultiBody(
+        baseMass=0,
+        baseVisualShapeIndex=goal_marker,
+        basePosition=goal_ee_pos
+    )
+    
+    print(f"\n{'='*60}")
+    print("VISUALIZATION:")
+    print(f"  Green sphere: START EE at {[f'{x:.2f}' for x in start_ee_pos]}")
+    print(f"  Blue sphere:  GOAL EE at {[f'{x:.2f}' for x in goal_ee_pos]}")
+    print(f"  Red box:      OBSTACLE at {obstacle_pos}")
+    print(f"{'='*60}")
+    
+    # Wait for user to see the setup
+    print("\nSetup complete. Press Enter to start planning...")
+    input()
+    
+    # Main test: Navigate from left to right around obstacle
+    print(f"\n{'='*60}")
+    print("MAIN TEST: Navigate LEFT → RIGHT around obstacle")
+    print(f"{'='*60}")
+    
+    path = planner.plan(start_config, goal_config, planning_time=10.0)
     
     if path:
-        print(f"\n✓ Success! Executing path...")
-        execute_path(panda, arm_joints, path)
-        time.sleep(1)
+        print(f"\n✓ Success! Path found. Executing...")
+        execute_path(panda, arm_joints, path, steps_per_waypoint=150)
     else:
-        print("\n✗ Planning failed")
+        print("\n✗ Planning failed - no collision-free path found")
     
-    # Test 2: Multi-joint movement
+    # Keep running for observation
     print(f"\n{'='*60}")
-    print("TEST 2: Navigate around obstacle")
-    print(f"{'='*60}")
-    
-    current = [p.getJointState(panda, j)[0] for j in arm_joints]
-    goal2 = home_config.copy()
-    goal2[0] += 0.6  # Move toward obstacle direction
-    goal2[1] -= 0.5
-    goal2[3] += 0.4
-    
-    path2 = planner.plan(current, goal2, planning_time=3.0)
-    
-    if path2:
-        print(f"\n✓ Success! Executing path...")
-        execute_path(panda, arm_joints, path2)
-    else:
-        print("\n✗ Planning failed")
-    
-    # Test 3: Longer path
-    print(f"\n{'='*60}")
-    print("TEST 3: Complex obstacle avoidance (stress test)")
-    print(f"{'='*60}")
-    
-    current = [p.getJointState(panda, j)[0] for j in arm_joints]
-    goal3 = home_config.copy()
-    goal3[0] += 1.2  # Large movement toward/through obstacle area
-    goal3[1] -= 0.7
-    goal3[5] += 0.8
-    
-    path3 = planner.plan(current, goal3, planning_time=5.0)
-    
-    if path3:
-        print(f"\n✓ Success! Executing path...")
-        execute_path(panda, arm_joints, path3)
-    else:
-        print("\n✗ Planning failed")
-    
-    # Keep running
-    print(f"\n{'='*60}")
-    print("Tests complete. Press Ctrl+C to exit")
+    print("Path execution complete!")
+    print("End-effector moved from GREEN to BLUE around RED obstacle")
+    print("Press Ctrl+C to exit")
     print(f"{'='*60}\n")
     
     try:
@@ -379,7 +456,11 @@ def test_panda_robot():
 
 def execute_path(robot_id, joint_ids, path, steps_per_waypoint=100):
     """Execute a planned path with smooth control"""
-    for waypoint in path:
+    print(f"Executing {len(path)} waypoints...")
+    for idx, waypoint in enumerate(path):
+        if idx % 5 == 0:
+            print(f"  Waypoint {idx+1}/{len(path)}")
+        
         for i, joint_id in enumerate(joint_ids):
             p.setJointMotorControl2(
                 robot_id,
