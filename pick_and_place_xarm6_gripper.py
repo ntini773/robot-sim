@@ -10,240 +10,7 @@ import numpy as np
 import json
 import fpsample
 
-import ompl.base as ob 
-import ompl.geometric as og
-
 CUBE_LENGTH = 0.05
-
-
-class OMPLPlanner:
-    """
-    OMPL-based motion planner for robot arms in PyBullet
-    """
-    
-    def __init__(self, robot, obstacles=None, collision_margin=0.01, ignore_base=True):
-        """
-        Initialize OMPL planner with FAST invisible collision robot
-        """
-        self.robot = robot
-        self.obstacles = obstacles or []
-        self.collision_margin = collision_margin
-        self.ignore_base = ignore_base
-        
-        # ============================================
-        # CREATE INVISIBLE COLLISION ROBOT (FAST)
-        # ============================================
-        print("Creating invisible collision robot for fast collision checking...")
-        
-        # Load collision robot FAR AWAY (y + 1000m, out of camera view)
-        collision_base_pos = [robot.base_pos[0], robot.base_pos[1] + 1000, robot.base_pos[2]]
-        
-        self.collision_robot_id = p.loadURDF(
-            "./lite-6-updated-urdf/lite_6_new.urdf",
-            collision_base_pos,
-            robot.base_ori,
-            useFixedBase=True,
-        )
-        
-        # Make collision robot INVISIBLE (alpha=0 on all links)
-        p.changeVisualShape(self.collision_robot_id, -1, rgbaColor=[0, 0, 0, 0])  # Base
-        for i in range(p.getNumJoints(self.collision_robot_id)):
-            p.changeVisualShape(self.collision_robot_id, i, rgbaColor=[0, 0, 0, 0])
-        
-        print(f"✓ Invisible collision robot created at y+1000m")
-        
-        # Define state space (6 DOF arm)
-        self.space = ob.RealVectorStateSpace(6)
-        
-        # Set bounds from robot joint limits
-        bounds = ob.RealVectorBounds(6)
-        for i in range(6):
-            bounds.setLow(i, self.robot.arm_lower_limits[i])
-            bounds.setHigh(i, self.robot.arm_upper_limits[i])
-        self.space.setBounds(bounds)
-            
-        # Create SimpleSetup
-        self.ss = og.SimpleSetup(self.space)
-        
-        # Set state validity checker (collision detection)
-        self.ss.setStateValidityChecker(ob.StateValidityCheckerFn(self.is_state_valid))
-        
-        # Configure AITstar planner
-        si = self.ss.getSpaceInformation()
-        si.setStateValidityCheckingResolution(0.01)
-        
-        planner = og.AITstar(si)
-        self.ss.setPlanner(planner)
-        
-        print(f"✓ OMPL Planner initialized with AITstar (FAST mode)")
-        print(f"  - Obstacles: {len(self.obstacles)}")
-        print(f"  - Collision margin: {self.collision_margin}m")
-    
-    def is_state_valid(self, state):
-        """
-        Check if configuration is collision-free using INVISIBLE collision robot (FAST)
-        VISIBLE robot never moves during planning!
-        """
-        # Extract joint angles from OMPL state
-        joint_angles = [state[i] for i in range(6)]
-        
-        # Set COLLISION robot to test configuration (invisible, far away)
-        for i, joint_id in enumerate(self.robot.arm_controllable_joints):
-            p.resetJointState(self.collision_robot_id, joint_id, joint_angles[i])
-        
-        p.performCollisionDetection()
-        
-        # Check self-collision
-        if self._check_self_collision():
-            return False
-        
-        # Check collision with obstacles
-        for obs_id in self.obstacles:
-            closest_points = p.getClosestPoints(
-                self.collision_robot_id, obs_id, 
-                distance=self.collision_margin
-            )
-            
-            if closest_points:
-                for pt in closest_points:
-                    robot_link = pt[3]
-                    distance = pt[8]
-                    
-                    # Skip base link if we're ignoring it
-                    if self.ignore_base and robot_link == -1:
-                        continue
-                    
-                    if distance < self.collision_margin:
-                        return False
-        
-        return True
-     
-    def _check_self_collision(self):
-        """Check robot self-collision using collision robot"""
-        contacts = p.getContactPoints(self.collision_robot_id, self.collision_robot_id)
-    
-        for contact in contacts:
-            link1 = contact[3]
-            link2 = contact[4]
-            
-            # Ignore base link collisions if flag is set
-            if self.ignore_base and (link1 == -1 or link2 == -1):
-                continue
-            
-            # Filter out adjacent link contacts (these are normal)
-            if abs(link1 - link2) > 1:  # Non-adjacent links colliding
-                return True
-    
-    def plan(self, start_config, goal_config, planning_time=5.0):
-        """
-        Plan a path from start to goal configuration
-        
-        Args:
-            start_config: List of 6 joint angles (start)
-            goal_config: List of 6 joint angles (goal)
-            planning_time: Max planning time in seconds
-            
-        Returns:
-            path: List of configurations (list of lists)
-                  Returns None if no path found
-        """
-        # Clear previous planning data
-        self.ss.clear()
-        
-        # Set start state
-        start = ob.State(self.space)
-        for i in range(6):
-            start[i] = start_config[i]
-        
-        # Set goal state
-        goal = ob.State(self.space)
-        for i in range(6):
-            goal[i] = goal_config[i]
-        
-        self.ss.setStartAndGoalStates(start, goal)
-        
-        print(f"Planning from {[f'{x:.2f}' for x in start_config]} to {[f'{x:.2f}' for x in goal_config]}...")
-        
-        # Solve
-        solved = self.ss.solve(planning_time)
-        
-        if solved:
-            # Simplify path
-            self.ss.simplifySolution()
-            
-            # Extract path
-            path = self.ss.getSolutionPath()
-            
-            # Convert to list of configurations
-            path_list = []
-            for i in range(path.getStateCount()):
-                state = path.getState(i)
-                config = [state[j] for j in range(6)]
-                path_list.append(config)
-            
-            return path_list
-        else:
-            print("✗ No path found within time limit")
-            return None
-        
-    def plan_to_pose(self, target_pos, target_orn, planning_time=5.0):
-        """
-        Plan to reach a target end-effector pose
-        
-        Uses IK to convert pose to joint angles, then plans in joint space
-        
-        Args:
-            target_pos: [x, y, z] position
-            target_orn: [x, y, z, w] quaternion orientation
-            planning_time: Max planning time in seconds
-            
-        Returns:
-            path: List of configurations, or None if planning fails
-        """
-        # Get current configuration
-        start_config = [p.getJointState(self.robot.id, j)[0] 
-                       for j in self.robot.arm_controllable_joints]
-        
-        # Compute IK for goal
-        goal_joint_angles = p.calculateInverseKinematics(
-            self.robot.id,
-            self.robot.eef_id,
-            target_pos,
-            target_orn,
-            lowerLimits=self.robot.arm_lower_limits,
-            upperLimits=self.robot.arm_upper_limits,
-            jointRanges=self.robot.arm_joint_ranges,
-            restPoses=self.robot.arm_rest_poses,
-            maxNumIterations=100,
-            residualThreshold=1e-5
-        )
-        goal_config = list(goal_joint_angles[:6])
-        
-        print(f"Target pose: pos={target_pos}, orn={target_orn}")
-        print(f"IK solution: {[f'{x:.2f}' for x in goal_config]}")
-        
-        # Check if goal is valid
-        if not self.is_state_valid_list(goal_config):
-            print("✗ Goal configuration is in collision!")
-            return None
-        
-        # Plan in joint space
-        return self.plan(start_config, goal_config, planning_time)
-    
-    def is_state_valid_list(self, config):
-        """Helper to check if a config list is valid"""
-        state = ob.State(self.space)
-        for i in range(6):
-            state[i] = config[i]
-        return self.is_state_valid(state)
-    def __del__(self):
-        """Cleanup: remove invisible collision robot"""
-        try:
-            if hasattr(self, 'collision_robot_id'):
-                p.removeBody(self.collision_robot_id)
-        except:
-            pass
-
 
 def create_cylinder(radius, height, pos, color=[0.7, 0.7, 0.7, 1]):
     """Creates a cylinder body using primitives."""
@@ -983,45 +750,6 @@ def move_to_pose_dynamic(
     print(f"  -> Warning: Did not reach target within {max_steps} steps. Final error: {dist:.4f}m")
     return False
 
-def move_to_pose_with_planner(motion_planner,
-    robot, target_pos, target_orn,
-    max_steps=200,   # Increased default steps for better settling
-    capture_frames=False,
-    iter_folder=None,
-    frame_counter=None,
-    threshold=0.01,  # 1cm accuracy
-    **kwargs
-):
-    trajectory = motion_planner.plan_to_pose(target_pos,target_orn,planning_time=5.0)
-    if trajectory is None:
-        print("❌❌❌ Failed to plan approach to pick")
-        return False
-    else: 
-        step=0
-        for j,joint_poses in enumerate(trajectory):
-            # Set joint targets
-            for i, joint_id in enumerate(robot.arm_controllable_joints):
-                p.setJointMotorControl2(
-                    robot.id,
-                    joint_id,
-                    p.POSITION_CONTROL,
-                    joint_poses[i],
-                    maxVelocity=robot.max_velocity,
-                )
-            update_simulation(1, robot=robot, capture_frames=capture_frames, 
-                            iter_folder=iter_folder, frame_counter=frame_counter, **kwargs)
-
-            # Check if target reached
-            current_pos, current_orn = robot.get_current_ee_position()
-            dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
-            
-            if dist < threshold:
-                # print(f"  Reached target in {step+1} steps.")
-                return True
-            if step+1> max_steps:
-                print(f"  -> Warning: Did not reach target within {max_steps} steps. Final error: {dist:.4f}m")
-                return False
-            step = step +1
 
 def random_color_cube(cube_id):
     color = [random.random(), random.random(), random.random(), 1.0]
@@ -1045,7 +773,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
     cube_id = None
     cylinder_id = None
-    while successful_iterations < 1:
+    while successful_iterations < 4:
         # Create temp folder for this attempt
         temp_folder = os.path.join(base_save_dir, f"temp_iter_{total_attempts:04d}")
         os.makedirs(temp_folder, exist_ok=True)
@@ -1101,20 +829,10 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
         eef_state = robot.get_current_ee_position()
         eef_orientation = eef_state[1]
-        motion_planner = OMPLPlanner(robot=robot,obstacles=[table_id, plane_id], collision_margin=0.02, ignore_base=True)
+
         # Phase 1: Move above cube
         print("Phase 1: Moving above cube...")
-        # move_to_pose_dynamic(
-        #     robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
-        #     capture_frames=True, iter_folder=temp_folder,
-        #     frame_counter=frame_counter, base_pos=robot.base_pos,
-        #     state_history=state_history, cube_id=cube_id,
-        #     cube_pos_history=cube_pos_history, table_id=table_id,
-        #     plane_id=plane_id, tray_id=cylinder_id,
-        #     EXCLUDE_TABLE=EXCLUDE_TABLE
-        # )
-        move_to_pose_with_planner(
-            motion_planner,
+        move_to_pose_dynamic(
             robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
@@ -1126,17 +844,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
         # Phase 2: Move down to grasp
         print("Phase 2: Moving down to grasp...")
-        # move_to_pose_dynamic(
-        #     robot, [cube_start_pos[0], cube_start_pos[1], 0.82], eef_orientation,
-        #     capture_frames=True, iter_folder=temp_folder,
-        #     frame_counter=frame_counter, base_pos=robot.base_pos,
-        #     state_history=state_history, cube_id=cube_id,
-        #     cube_pos_history=cube_pos_history, table_id=table_id,
-        #     plane_id=plane_id, tray_id=cylinder_id,
-        #     EXCLUDE_TABLE=EXCLUDE_TABLE
-        # )
-        move_to_pose_with_planner(
-            motion_planner,
+        move_to_pose_dynamic(
             robot, [cube_start_pos[0], cube_start_pos[1], 0.82], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
@@ -1145,6 +853,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
+
         # Phase 3: Close gripper
         print("Phase 3: Closing gripper...")
         interpolate_gripper(
@@ -1159,17 +868,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
         # Phase 4: Lift cube
         print("Phase 4: Lifting cube...")
-        # move_to_pose_dynamic(
-        #     robot, [cube_start_pos[0], cube_start_pos[1], 1.00], eef_orientation,
-        #     capture_frames=True, iter_folder=temp_folder,
-        #     frame_counter=frame_counter, base_pos=robot.base_pos,
-        #     state_history=state_history, cube_id=cube_id,
-        #     cube_pos_history=cube_pos_history, table_id=table_id,
-        #     plane_id=plane_id, tray_id=cylinder_id,
-        #     EXCLUDE_TABLE=EXCLUDE_TABLE
-        # )
-        move_to_pose_with_planner(
-            motion_planner,
+        move_to_pose_dynamic(
             robot, [cube_start_pos[0], cube_start_pos[1], 1.00], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
@@ -1186,17 +885,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.22]
         print(f"  Target position: [{target_drop_pos[0]:.4f}, {target_drop_pos[1]:.4f}, {target_drop_pos[2]:.4f}]")
 
-        # move_to_pose_dynamic(
-        #     robot, target_drop_pos, eef_orientation,
-        #     capture_frames=True, iter_folder=temp_folder,
-        #     frame_counter=frame_counter, base_pos=robot.base_pos,
-        #     state_history=state_history, cube_id=cube_id,
-        #     cube_pos_history=cube_pos_history, table_id=table_id,
-        #     plane_id=plane_id, tray_id=cylinder_id,
-        #     EXCLUDE_TABLE=EXCLUDE_TABLE
-        # )
-        move_to_pose_with_planner(
-            motion_planner,
+        move_to_pose_dynamic(
             robot, target_drop_pos, eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
@@ -1393,8 +1082,8 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         cube_id = None
         cylinder_id = None
 
-        del motion_planner
         total_attempts += 1
+
         # Print progress
         print(f"\n{'='*60}")
         print(f"PROGRESS UPDATE")
