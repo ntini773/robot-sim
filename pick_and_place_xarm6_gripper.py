@@ -773,7 +773,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
     cube_id = None
     cylinder_id = None
-    while successful_iterations < 4:
+    while successful_iterations < 1:
         # Create temp folder for this attempt
         temp_folder = os.path.join(base_save_dir, f"temp_iter_{total_attempts:04d}")
         os.makedirs(temp_folder, exist_ok=True)
