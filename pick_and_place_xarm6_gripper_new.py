@@ -12,9 +12,30 @@ import fpsample
 
 import ompl.base as ob 
 import ompl.geometric as og
-
+from planner import RobotOMPLPlanner, solve_ik_collision_free,solve_ik, visualise_eef_traj
+import test_lite6_ompl
 CUBE_LENGTH = 0.05
 
+def create_cylinder(radius, height, pos, color=[0.7, 0.7, 0.7, 1]):
+    """Creates a cylinder body using primitives."""
+    visual_shape = p.createVisualShape(
+        p.GEOM_CYLINDER,
+        radius=radius,
+        length=height,
+        rgbaColor=color
+    )
+    collision_shape = p.createCollisionShape(
+        p.GEOM_CYLINDER,
+        radius=radius,
+        height=height
+    )
+    body_id = p.createMultiBody(
+        baseMass=0,  # Static object
+        baseCollisionShapeIndex=collision_shape,
+        baseVisualShapeIndex=visual_shape,
+        basePosition=[pos[0], pos[1], pos[2] + height/2] # Center vertically
+    )
+    return body_id
 class Lite6Robot:
     def __init__(self, pos, ori):
         self.base_pos = pos
@@ -210,7 +231,10 @@ class Lite6Robot:
         """Robustly reset the robot to the initial pose and gripper open."""
         # Initial reset posture
         initial_pos_world = [0.125, 0.01, 0.62 + 0.377]
-        initial_orn_world = p.getQuaternionFromEuler([3.14, 0, 0])
+        # Old orientation not considering the tcp axes
+        # initial_orn_world = p.getQuaternionFromEuler([3.14, 0, 0])
+        # Now considering the TCP orientation as well, which is rotated 90 degrees around Y from the base link
+        initial_orn_world = p.getQuaternionFromEuler([-1.5708,0, 1.5708])
 
         # Reset joints to rest_poses FIRST
         for i, joint_id in enumerate(self.arm_controllable_joints):
@@ -731,6 +755,74 @@ def move_to_pose_dynamic(
     print(f"  -> Warning: Did not reach target within {max_steps} steps. Final error: {dist:.4f}m")
     return False
 
+def move_with_planner(planner,robot, target_pos, target_orn,
+                      max_steps_per_waypoint=10,capture_frames=False, iter_folder=None,
+                      frame_counter=None,threshold=0.01, **kwargs):
+    start_pos, start_orn = robot.get_current_ee_position()
+    start_config = robot.get_robot_state()[:robot.arm_num_dofs]
+    goal_config = solve_ik(robot, planner, target_pos, target_orn)  # Get only arm joints for planning
+    if goal_config is None:
+        print("✗ Planning failed, IK could not find a solution.")
+        return False
+    planner._snapshot_gripper_pose()
+    success,path = planner.plan(start_config, goal_config,planning_time=10.0)
+    if not path:
+        print("✗ Planning failed, No path found.")
+        return False
+
+    # Visualize planned path
+    test_lite6_ompl.visualize_path(robot, path)
+    for i, joint_id in enumerate(robot.arm_controllable_joints):
+        p.resetJointState(robot.id, joint_id, start_config[i])
+    planner._apply_frozen_gripper_printing()  # Ensure gripper stays in place during execution
+    #######################################################
+    ### EXECUTE WITH PLANNER (REPLANNING + CLOSED-LOOP) ###
+    print(f"\nExecuting path with {len(path)} waypoints...")
+    for i, waypoint in enumerate(path):
+            # Set joint targets for only joints of lite6 , not the gripper
+            for j, joint_id in enumerate(planner.joint_ids):
+                p.setJointMotorControl2(
+                    planner.robot.id,
+                    joint_id,
+                    p.POSITION_CONTROL,
+                    waypoint[j],
+                    maxVelocity=getattr(planner.robot, 'max_velocity', 3.0),
+                    force=200
+                )
+             # Get current end-effector position
+            eef_state = p.getLinkState(planner.robot.id, planner.robot.eef_id)
+            current_eef_pos = eef_state[0]  # World position of the link
+
+            # Visualize trajectory  
+            visualise_eef_traj(current_eef_pos)
+                
+            # Simulate motion to waypoint
+            for _ in range(max_steps_per_waypoint):
+                # 2. Advance simulation
+                planner._apply_frozen_gripper()  # Ensure gripper stays in place during execution
+                update_simulation(1, robot=robot, capture_frames=capture_frames, 
+                          iter_folder=iter_folder, frame_counter=frame_counter, **kwargs)
+                print(f"Gripper pos: {p.getJointState(robot.id, robot.mimic_parent_id)[0]:.4f}")
+                # p.stepSimulation()
+                # time.sleep(dt)
+                
+                # Early exit if close enough
+                current = [p.getJointState(planner.robot.id, j)[0] for j in planner.joint_ids]
+                if np.max(np.abs(np.array(current) - np.array(waypoint))) < 0.01:
+                    break
+            
+            if i % max(1, len(path) // 10) == 0:
+                print(f"  Progress: {i+1}/{len(path)} waypoints")
+            # 3. Check if target reached
+            current_pos, current_orn = robot.get_current_ee_position()
+            dist = np.linalg.norm(np.array(current_pos) - np.array(target_pos))
+            if dist < threshold:
+                # print(f"  Reached target in {step+1} steps.")
+                continue
+    return True
+
+    # planner.execute(path, dt=1/120, steps_per_waypoint=200)
+
 
 def random_color_cube(cube_id):
     color = [random.random(), random.random(), random.random(), 1.0]
@@ -754,7 +846,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
     cube_id = None
     cylinder_id = None
-    while successful_iterations < 1:
+    while successful_iterations < 5:
         # Create temp folder for this attempt
         temp_folder = os.path.join(base_save_dir, f"temp_iter_{total_attempts:04d}")
         os.makedirs(temp_folder, exist_ok=True)
@@ -810,11 +902,37 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
         eef_state = robot.get_current_ee_position()
         eef_orientation = eef_state[1]
+        planner1 = RobotOMPLPlanner(
+        robot=robot,
+        robot_urdf="./lite-6-updated-urdf/lite_6_new.urdf",
+        obstacles=[table_id,cube_id],
+        collision_margin=0.02,
+        ignore_base=True
+        )
+        planner1.set_planner("AITStar")
+
+        planner2 = RobotOMPLPlanner(
+        robot=robot,
+        robot_urdf="./lite-6-updated-urdf/lite_6_new.urdf",
+        obstacles=[table_id,cylinder_id],
+        collision_margin=0.02,
+        ignore_base=True
+        )
+        planner2.set_planner("AITStar")
 
         # Phase 1: Move above cube
         print("Phase 1: Moving above cube...")
-        move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
+        # move_to_pose_dynamic(
+        #     robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
+        #     capture_frames=True, iter_folder=temp_folder,
+        #     frame_counter=frame_counter, base_pos=robot.base_pos,
+        #     state_history=state_history, cube_id=cube_id,
+        #     cube_pos_history=cube_pos_history, table_id=table_id,
+        #     plane_id=plane_id, tray_id=cylinder_id,
+        #     EXCLUDE_TABLE=EXCLUDE_TABLE
+        # )
+        step1 = move_with_planner(
+            planner1, robot, [cube_start_pos[0], cube_start_pos[1], 0.8], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -822,11 +940,12 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
+        step1_history = state_history.copy()
 
         # Phase 2: Move down to grasp
         print("Phase 2: Moving down to grasp...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 0.82], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.65], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -834,6 +953,8 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
+        planner1.cleanup()
+        step2_history = state_history.copy()
 
         # Phase 3: Close gripper
         print("Phase 3: Closing gripper...")
@@ -846,11 +967,12 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
+        step3_history = state_history.copy()
 
         # Phase 4: Lift cube
         print("Phase 4: Lifting cube...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 1.00], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.8], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -858,16 +980,29 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
+        step4_history = state_history.copy()
 
         # Phase 5: Move above cylinder
         print("Phase 5: Moving above cylinder target...")
         # Target the top of the cylinder [0.3, 0.3, 0.625 + 0.04] + half cube height [0.025] + safety margin
         cylinder_height = 0.04
-        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.22]
+        ## old pos 
+        # target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.22]
+        ## new pos
+        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.02]
         print(f"  Target position: [{target_drop_pos[0]:.4f}, {target_drop_pos[1]:.4f}, {target_drop_pos[2]:.4f}]")
 
-        move_to_pose_dynamic(
-            robot, target_drop_pos, eef_orientation,
+        # move_to_pose_dynamic(
+        #     robot, target_drop_pos, eef_orientation,
+        #     capture_frames=True, iter_folder=temp_folder,
+        #     frame_counter=frame_counter, base_pos=robot.base_pos,
+        #     state_history=state_history, cube_id=cube_id,
+        #     cube_pos_history=cube_pos_history, table_id=table_id,
+        #     plane_id=plane_id, tray_id=cylinder_id,
+        #     EXCLUDE_TABLE=EXCLUDE_TABLE
+        # )
+        move_with_planner(
+            planner2, robot, target_drop_pos, eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -875,7 +1010,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
-
+        step5_history = state_history.copy()
         # Phase 6: Open gripper to release
         print("Phase 6: Opening gripper to release...")
         interpolate_gripper(
@@ -887,7 +1022,8 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             plane_id=plane_id, tray_id=cylinder_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE
         )
-
+        step6_history = state_history.copy()
+        planner2.cleanup()
         # Phase 7: Wait for cube to settle
         print("Phase 7: Waiting for cube to settle...")
         for _ in range(500):
@@ -1042,7 +1178,13 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
             print(f"  Agent states shape: {agent_pos.shape}")
             print(f"  Actions shape: {actions.shape}")
             print(f"  Cube positions shape: {cube_positions.shape}")
-
+            np.save(os.path.join(final_folder, "step1_history.npy"), step1_history)
+            np.save(os.path.join(final_folder, "step2_history.npy"), step2_history)
+            np.save(os.path.join(final_folder, "step3_history.npy"), step3_history) 
+            np.save(os.path.join(final_folder, "step4_history.npy"), step4_history)
+            np.save(os.path.join(final_folder, "step5_history.npy"), step5_history)
+            np.save(os.path.join(final_folder, "step6_history.npy"), step6_history)
+            
             successful_iterations += 1
 
         else:
@@ -1099,6 +1241,18 @@ def main():
     _, table_id, plane_id = setup_simulation(freq=60, gui=True)
     robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
     robot.load()
+    tcp_link_index = -1
+    for i in range(p.getNumJoints(robot.id)):
+        joint_info = p.getJointInfo(robot.id, i)
+        # index 1 is the joint name, index 12 is the child link name
+        link_name = joint_info[12].decode('utf-8') 
+        if link_name == "tcp":
+            tcp_link_index = i
+            print(f"Found TCP link '{link_name}' at index {tcp_link_index}")
+            break
+
+    if tcp_link_index != -1:
+        robot.eef_id = tcp_link_index
     move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE=EXCLUDE_TABLE)
 
 

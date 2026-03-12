@@ -58,12 +58,23 @@ def setup_environment():
     
     # Floating obstacle
     box1 = create_box(
-        position=[0.35, -0.01, 0.85],
+        position=[0.5, -0.01, 0.8],
         size=[0.1, 0.08, 0.1],
         color=[1, 0, 0, 1]
     )
+    box2 = create_box(
+        position=[-0.25, -0.01, 0.8],
+        size=[0.1, 0.8, 0.6],
+        color=[1, 0, 0, 1]
+    )
+    box3 = create_box(
+        position=[0.0, 0.0, 1.4],
+        size=[0.8, 0.8, 0.01],
+        color=[1, 0, 0, 1]
+    )
     
-    obstacles = [plane_id, table_id,box1]
+    obstacles = [plane_id, table_id,box1,box2,box3]
+    # obstacles = [plane_id, table_id,box1]
     return table_id, obstacles
 
 

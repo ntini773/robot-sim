@@ -569,7 +569,19 @@ class RobotOMPLPlanner:
         """
         for jid, angle in zip(self.gripper_joint_ids, self.frozen_gripper_angles):
             p.resetJointState(self.robot.id, jid, angle)
+    def _apply_frozen_gripper_printing(self):
+        """
+        Reset gripper joints to their frozen angles.
+        Called inside is_state_valid() so every collision sample
+        has the gripper in the correct pose.
+        """
+        for jid, angle in zip(self.gripper_joint_ids, self.frozen_gripper_angles):
+            p.resetJointState(self.robot.id, jid, angle)
+        print(f"Planning Done , restoring the freezed gripper pose: {[f'{a:.4f}' for a in self.frozen_gripper_angles]}")
 
+    def cleanup(self):
+        """No-op — original planner has no ghost bodies to remove."""
+        pass
 
 class FrankaRobot:
     """
