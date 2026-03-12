@@ -98,7 +98,6 @@ def test_planner(planner_type, robot, planner, obstacles,
     
     # Set planner algorithm
     planner.set_planner(planner_type)
-    planner.setRange(0.2)
     
     # Solve IK with collision checking
     print("Solving IK for start...")
