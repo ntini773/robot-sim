@@ -1,3 +1,0 @@
-[submodule "pybullet_ompl"]
-	path = pybullet_ompl
-	url = https://github.com/ntini773/pybullet_ompl.git
