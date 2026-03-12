@@ -6,6 +6,8 @@ Same RobotOMPLPlanner works for both 6-DOF and 7-DOF robots.
 Uses solve_ik_collision_free for robust IK with collision checking.
 """
 
+# Import planner
+from planner import RobotOMPLPlanner, solve_ik, solve_ik_collision_free
 import sys
 import pybullet as p
 import pybullet_data
@@ -15,8 +17,6 @@ import time
 # Import Lite6Robot from existing pick_and_place script
 from pick_and_place_xarm6_gripper import Lite6Robot
 
-# Import planner
-from planner import RobotOMPLPlanner, solve_ik_collision_free
 
 
 def create_box(position, size=[0.1,0.1,0.1], color=[1,0,0,1]):
@@ -58,12 +58,12 @@ def setup_environment():
     
     # Floating obstacle
     box1 = create_box(
-        position=[0.5, 0, 0.9],
+        position=[0.35, -0.01, 0.85],
         size=[0.1, 0.08, 0.1],
         color=[1, 0, 0, 1]
     )
     
-    obstacles = [plane_id, table_id, box1]
+    obstacles = [plane_id, table_id,box1]
     return table_id, obstacles
 
 
@@ -84,7 +84,10 @@ def visualize_path(robot, path):
             p.addUserDebugLine(prev_ee, ee_pos, [0, 1, 0], 3)
         
         prev_ee = ee_pos
-
+    
+    # for i, joint_id in enumerate(robot.arm_controllable_joints):
+    #         p.resetJointState(robot.id, joint_id, waypoint[0])
+    
 
 def test_planner(planner_type, robot, planner, obstacles,
                  start_pos, start_orn, goal_pos, goal_orn):
@@ -95,10 +98,12 @@ def test_planner(planner_type, robot, planner, obstacles,
     
     # Set planner algorithm
     planner.set_planner(planner_type)
+    planner.setRange(0.2)
     
     # Solve IK with collision checking
     print("Solving IK for start...")
     start_config = solve_ik_collision_free(robot, planner, start_pos, start_orn)
+    # start_config = solve_ik(robot, planner, start_pos, start_orn)
     
     if start_config is None:
         print(f"✗ {planner_type}: Failed to find collision-free start IK")
@@ -106,6 +111,7 @@ def test_planner(planner_type, robot, planner, obstacles,
     
     print("Solving IK for goal...")
     goal_config = solve_ik_collision_free(robot, planner, goal_pos, goal_orn)
+    # goal_config = solve_ik(robot, planner, goal_pos, goal_orn)
     
     if goal_config is None:
         print(f"✗ {planner_type}: Failed to find collision-free goal IK")
@@ -135,6 +141,8 @@ def test_planner(planner_type, robot, planner, obstacles,
     
     # Plan
     start_time = time.time()
+    # After robot closes gripper on the box, before calling planner.plan():
+    planner._snapshot_gripper_pose()   # re-freeze at "holding" position
     success, path = planner.plan(start_config, goal_config, planning_time=10.0)
     planning_time = time.time() - start_time
     
@@ -157,9 +165,14 @@ def test_planner(planner_type, robot, planner, obstacles,
         
         # Execute path
         print("Executing planned path...")
-        planner.execute(path, dt=1/240, steps_per_waypoint=50)
-        
-        return path, planning_time, path_length
+        try:
+            while True:
+                for i, joint_id in enumerate(robot.arm_controllable_joints):
+                    p.resetJointState(robot.id, joint_id, start_config[i])
+                planner.execute(path, dt=1/120, steps_per_waypoint=200)
+        except KeyboardInterrupt:
+            print("\nExecution interrupted by user.") 
+            return path, planning_time, path_length
     else:
         print(f"✗ {planner_type} failed to find a path")
         return None, planning_time, None
@@ -177,10 +190,13 @@ def main():
     p.setGravity(0, 0, -9.8)
     
     # Define start and goal poses
-    start_pos = [0.4, -0.3, 0.85]
-    start_orn = p.getQuaternionFromEuler([3.14, 0, 0])
-    goal_pos = [0.4, 0.2, 0.85]
-    goal_orn = p.getQuaternionFromEuler([3.14, 0, 0])
+    start_pos = [0.2, -0.3, 0.85]
+    # start_orn = p.getQuaternionFromEuler([3.14, 0, 0])
+    start_orn = p.getQuaternionFromEuler([-1.5708,0, 1.5708])
+
+    goal_pos = [0.2, 0.2, 0.8]
+    # goal_orn = p.getQuaternionFromEuler([3.14, 0, 0])
+    goal_orn = p.getQuaternionFromEuler([-1.5708,0, 1.5708])
     
     # Visualize start and goal positions
     start_marker = p.createVisualShape(
@@ -215,12 +231,24 @@ def main():
     print("="*60)
     robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
     robot.load()
+    tcp_link_index = -1
+    for i in range(p.getNumJoints(robot.id)):
+        joint_info = p.getJointInfo(robot.id, i)
+        # index 1 is the joint name, index 12 is the child link name
+        link_name = joint_info[12].decode('utf-8') 
+        if link_name == "tcp":
+            tcp_link_index = i
+            break
+
+    if tcp_link_index != -1:
+        robot.eef_id = tcp_link_index
+        print(f"TCP found at index: {robot.eef_id}")
     
     # Disable collision between robot and table
-    for j in range(p.getNumJoints(robot.id)):
-        p.setCollisionFilterPair(
-            robot.id, table_id, j, -1, enableCollision=0
-        )
+    # for j in range(p.getNumJoints(robot.id)):
+    #     p.setCollisionFilterPair(
+    #         robot.id, table_id, j, -1, enableCollision=0
+    #     )
     
     # Create planner (reuse for both algorithms)
     print("\n" + "="*60)
@@ -235,7 +263,7 @@ def main():
     )
     
     # Disable collision between collision robot and table (robot is mounted on table)
-    planner.set_collision_filter(robot, table_id, link_a=-1)
+    # planner.set_collision_filter(robot, table_id, link_a=-1)
     
     # Test AITstar
     print("\n" + "="*60)
@@ -250,32 +278,32 @@ def main():
     # Wait a moment
     time.sleep(2)
     
-    # Test RRTstar (reuse same planner instance)
-    rrtstar_result = test_planner(
-        "RRTstar", robot, planner, obstacles,
-        start_pos, start_orn, goal_pos, goal_orn
-    )
+    # # Test RRTstar (reuse same planner instance)
+    # rrtstar_result = test_planner(
+    #     "RRTstar", robot, planner, obstacles,
+    #     start_pos, start_orn, goal_pos, goal_orn
+    # )
     
-    # Comparison
-    print("\n" + "="*60)
-    print("PERFORMANCE COMPARISON")
-    print("="*60)
+    # # Comparison
+    # print("\n" + "="*60)
+    # print("PERFORMANCE COMPARISON")
+    # print("="*60)
     
-    if aitstar_result[0] and rrtstar_result[0]:
-        print(f"\nAITstar:")
-        print(f"  Planning time: {aitstar_result[1]:.2f}s")
-        print(f"  Waypoints: {len(aitstar_result[0])}")
-        print(f"  Path length: {aitstar_result[2]:.3f} rad")
+    # if aitstar_result[0] and rrtstar_result[0]:
+    #     print(f"\nAITstar:")
+    #     print(f"  Planning time: {aitstar_result[1]:.2f}s")
+    #     print(f"  Waypoints: {len(aitstar_result[0])}")
+    #     print(f"  Path length: {aitstar_result[2]:.3f} rad")
         
-        print(f"\nRRTstar:")
-        print(f"  Planning time: {rrtstar_result[1]:.2f}s")
-        print(f"  Waypoints: {len(rrtstar_result[0])}")
-        print(f"  Path length: {rrtstar_result[2]:.3f} rad")
+    #     print(f"\nRRTstar:")
+    #     print(f"  Planning time: {rrtstar_result[1]:.2f}s")
+    #     print(f"  Waypoints: {len(rrtstar_result[0])}")
+    #     print(f"  Path length: {rrtstar_result[2]:.3f} rad")
         
-        if aitstar_result[2] < rrtstar_result[2]:
-            print(f"\n✓ AITstar found shorter path by {rrtstar_result[2] - aitstar_result[2]:.3f} rad")
-        else:
-            print(f"\n✓ RRTstar found shorter path by {aitstar_result[2] - rrtstar_result[2]:.3f} rad")
+    #     if aitstar_result[2] < rrtstar_result[2]:
+    #         print(f"\n✓ AITstar found shorter path by {rrtstar_result[2] - aitstar_result[2]:.3f} rad")
+    #     else:
+    #         print(f"\n✓ RRTstar found shorter path by {aitstar_result[2] - rrtstar_result[2]:.3f} rad")
     
     print(f"\n{'='*60}\n")
     

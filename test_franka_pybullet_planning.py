@@ -23,7 +23,6 @@ class PandaRobot:
         self.lower_limits = None
         self.upper_limits = None
 
-
     # ---------------------------------
     # Load robot
     # ---------------------------------
@@ -32,8 +31,8 @@ class PandaRobot:
         p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
         self.robot_id = load_pybullet(
-            # "franka_panda/panda.urdf",
-            "lite-6-updated-urdf/lite_6_new.urdf",
+            "franka_panda/panda.urdf",
+            # "lite-6-updated-urdf/lite_6_new.urdf",
             fixed_base=True
         )
 

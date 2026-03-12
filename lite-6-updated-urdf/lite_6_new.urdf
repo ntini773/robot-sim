@@ -439,6 +439,16 @@
      <axis xyz="1 0 0"/> <limit lower="-0.04" upper="0" effort="50" velocity="0.2"/>
       <mimic joint="left_finger_joint" multiplier="1" offset="0"/>
   </joint>
+  <!-- ================= TOOL CENTER POINT ================= -->
+    <link name="tcp"/>
+
+  <joint name="tcp_joint" type="fixed">
+    <parent link="base_link"/>
+    <child link="tcp"/>
+    <!-- center between the fingers -->
+    <origin xyz="0 0.17 0" rpy="0 0 0"/>
+  </joint>
+
 
 </robot>
 

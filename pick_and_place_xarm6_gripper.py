@@ -12,6 +12,44 @@ import fpsample
 
 CUBE_LENGTH = 0.05
 
+def visualise_eef_traj(current_eef_pos, prev_line_id=None):
+    """
+    Visualizes end-effector trajectory by drawing a small sphere at current position
+    and a line to the previous position if available.
+    
+    Args:
+        current_eef_pos: Current end-effector position [x, y, z]
+        prev_line_id: Previous line ID to maintain trajectory
+        
+    Returns:
+        line_id: ID of the drawn line segment
+    """
+    # Draw a small red sphere at current EEF position
+    p.addUserDebugPoints(
+        pointPositions=[current_eef_pos],
+        pointColorsRGB=[[1, 0, 0]],  # Red color
+        pointSize=5,
+        lifeTime=0  # Permanent
+    )
+    
+    # Store previous position for line drawing
+    if not hasattr(visualise_eef_traj, 'prev_pos'):
+        visualise_eef_traj.prev_pos = None
+    
+    line_id = None
+    if visualise_eef_traj.prev_pos is not None:
+        # Draw line from previous to current position
+        line_id = p.addUserDebugLine(
+            lineFromXYZ=visualise_eef_traj.prev_pos,
+            lineToXYZ=current_eef_pos,
+            lineColorRGB=[0, 1, 0],  # Green color
+            lineWidth=2,
+            lifeTime=0  # Permanent
+        )
+    
+    visualise_eef_traj.prev_pos = current_eef_pos
+    return line_id
+
 def create_cylinder(radius, height, pos, color=[0.7, 0.7, 0.7, 1]):
     """Creates a cylinder body using primitives."""
     visual_shape = p.createVisualShape(

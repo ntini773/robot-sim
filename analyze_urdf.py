@@ -17,7 +17,12 @@ def setup_environment():
     p.setAdditionalSearchPath(pybullet_data.getDataPath())
     plane_id = p.loadURDF("plane.urdf", [0, 0, 0], useMaximalCoordinates=True)
     table_id = p.loadURDF("table/table.urdf", [0.5, 0, 0], p.getQuaternionFromEuler([0, 0, 0]))
-    box1 = create_box(position=[0.55, 0, 1.2], size=[0.25, 0.08, 0.15], color=[1, 0, 0, 1])
+    # box1 = create_box(position=[0.55, 0, 1.2], size=[0.25, 0.08, 0.15], color=[1, 0, 0, 1])
+    box1 = create_box(
+        position=[0.3, -0.01, 0.85],
+        size=[0.1, 0.08, 0.1],
+        color=[1, 0, 0, 1]
+    )
     obstacles = [plane_id, table_id, box1]
     return table_id, obstacles
 
@@ -32,7 +37,7 @@ p.setAdditionalSearchPath(pybullet_data.getDataPath())
 
 table_id, obstacles = setup_environment()
 # robot = p.loadURDF("franka_panda/panda.urdf", [0, 0, 0.63], useFixedBase=True)
-robot = p.loadURDF("./lite-6-updated-urdf/lite_6_new.urdf", [0, 0, 0.7], useFixedBase=True)
+robot = p.loadURDF("./lite-6-updated-urdf/lite_6_new.urdf", [0, 0, 0.62], useFixedBase=True)
 num_joints = p.getNumJoints(robot)
 
 sliders = {}
@@ -61,7 +66,15 @@ CAMERA_THRESHOLD = 0.01
 
 prev_config = [0.0] * len(joint_ids)
 prev_cam = p.getDebugVisualizerCamera()
-
+eef_index = -1
+for i in range(num_joints):
+    info = p.getJointInfo(robot, i)
+    if info[12].decode() == "tcp": # Check child link name
+        eef_index = i
+        break
+# if eef_index == -1: eef_index = num_joints - 1 # Fallback
+print_euler_for_eef = True if eef_index != -1 else False
+print(f"End-effector link index: {eef_index}  (print_euler_for_eef={print_euler_for_eef})")
 # Main control loop
 while True:
     current_config = []
@@ -81,7 +94,25 @@ while True:
         formatted = [round(v, 4) for v in current_config]
         print(f"Joint config: {formatted}")
         prev_config = current_config[:]
+    if print_euler_for_eef:
+        # GET EEF STATE
+        eef_state = p.getLinkState(robot, eef_index, computeForwardKinematics=True)
+        eef_quat = eef_state[5] # Orientation quaternion
+        eef_euler = p.getEulerFromQuaternion(eef_quat)
+        eef_pos = eef_state[4]
 
+        # PRINT ON CHANGE (Add to your existing change detection)
+        if any(abs(current_config[k] - prev_config[k]) > CHANGE_THRESHOLD for k in range(len(joint_ids))):
+            formatted_joints = [round(v, 4) for v in current_config]
+            formatted_euler = [round(v, 4) for v in eef_euler]
+            
+            print("-" * 30)
+            print(f"Joint Config: {formatted_joints}")
+            print(f"TCP Pos: {[round(v, 3) for v in eef_pos]}")
+            print(f"TCP Euler (for goal_orn): {formatted_euler}")
+            print(f"Code: goal_orn = p.getQuaternionFromEuler({formatted_euler})")
+            
+            prev_config = current_config[:]
     # Print camera info on change
     cam = p.getDebugVisualizerCamera()
     if (abs(cam[10] - prev_cam[10]) > CAMERA_THRESHOLD or   # distance
