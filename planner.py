@@ -3,25 +3,71 @@ Simple OMPL Motion Planner - Uses visible robot for collision checking
 
 Interface similar to pybullet_ompl with visible collision checking for easy debugging.
 
-Usage:
+New in this version
+-------------------
+* ``sample_ik_candidates`` – generate IK candidates for exactly **two yaw
+  variants** (grasp aligned with cube X axis / cube Y axis, i.e. 90° apart
+  about world Z).  Tries multiple seeds per variant, collision-checks each,
+  and returns the top-N ranked by distance-to-start + joint-limit cost.
+
+* ``score_ik_candidate`` – standalone scoring function (distance-to-start +
+  joint-limit cost).
+
+* ``RobotOMPLPlanner.plan()`` now accepts **a list of goal configs** (produced
+  by ``sample_ik_candidates``).  Goals are tried in order; the first
+  successful plan is returned.  Each attempt uses a two-stage fallback:
+  RRTConnect (fast feasibility) → configured planner.
+
+* ``RobotOMPLPlanner.plan_to_pose()`` – one-shot API: given a target EEF pose
+  and the cube's base orientation, generates IK candidates for the X/Y yaw
+  variants and plans to the best one.
+
+Backward compatibility
+----------------------
+Existing code calling ``plan(start, goal_config)`` with a flat list still
+works unchanged.
+
+Usage (new API)
+---------------
+    from planner import RobotOMPLPlanner, sample_ik_candidates
+
+    planner = RobotOMPLPlanner(robot, obstacles)
+    planner.set_planner("AITstar")
+
+    # Option A: high-level one-shot API
+    success, path = planner.plan_to_pose(
+        start_config=current_joints,
+        pos=target_pos,
+        base_orn=target_orn,   # two yaw variants auto-generated
+        planning_time=10.0,
+    )
+
+    # Option B: manual IK sampling + multi-goal planning
+    candidates = sample_ik_candidates(robot, planner, target_pos, target_orn,
+                                       q_start=current_joints)
+    success, path = planner.plan(current_joints, candidates)
+
+    # Option C: original single-goal API (unchanged)
+    success, path = planner.plan(start_joints, goal_joints)
+
+    if success:
+        planner.execute(path)
+
+Usage (original)
+----------------
     from planner import RobotOMPLPlanner, FrankaRobot, solve_ik_collision_free
-    
-    # Setup robot and environment
+
     robot = FrankaRobot([0, 0, 0.63], [0, 0, 0])
     robot.load()
-    
-    # Create planner
+
     planner = RobotOMPLPlanner(robot, obstacles)
-    planner.set_planner("AITstar")  # or "RRTstar", "RRTConnect"
-    
-    # Solve IK with collision checking
+    planner.set_planner("AITstar")
+
     start = solve_ik_collision_free(robot, planner, start_pos, start_orn)
-    goal = solve_ik_collision_free(robot, planner, goal_pos, goal_orn)
-    
-    # Plan path
+    goal  = solve_ik_collision_free(robot, planner, goal_pos,  goal_orn)
+
     res, path = planner.plan(start, goal, planning_time=10.0)
-    
-    # Execute path
+
     if res:
         planner.execute(path)
 """
@@ -34,6 +80,229 @@ from collections import namedtuple
 
 import ompl.base as ob
 import ompl.geometric as og
+
+
+def _quat_mul(q1, q2):
+    """
+    Hamilton product of two quaternions in PyBullet convention [x, y, z, w].
+    q1 is applied *after* q2 (i.e. result = q1 * q2).
+    """
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return np.array([
+        w1*x2 + x1*w2 + y1*z2 - z1*y2,
+        w1*y2 - x1*z2 + y1*w2 + z1*x2,
+        w1*z2 + x1*y2 - y1*x2 + z1*w2,
+        w1*w2 - x1*x2 - y1*y2 - z1*z2,
+    ])
+
+
+def _two_yaw_variants(base_orn):
+    """
+    Given a base end-effector orientation, return exactly two quaternions that
+    differ by 90° about the **world Z axis**.
+
+    These correspond to grasping a cube aligned with its X axis (``base_orn``)
+    and grasping aligned with its Y axis (``base_orn`` rotated 90° about world
+    Z).  Both are geometrically valid symmetric grasps; trying both dramatically
+    increases IK / planning success.
+
+    Convention
+    ----------
+    - Rotation axis: world +Z  (equivalent to tool Z for top-down grasps).
+    - Rotation angle: 0° and +90°.
+
+    Args:
+        base_orn: quaternion [x, y, z, w]  (PyBullet convention)
+
+    Returns:
+        list of two quaternions [[x,y,z,w], [x,y,z,w]]
+    """
+    base = np.array(base_orn, dtype=float)
+    # 90° rotation about world +Z: q_rot = [0, 0, sin(π/4), cos(π/4)]
+    s = np.sin(np.pi / 4.0)
+    c = np.cos(np.pi / 4.0)
+    q_rot_z90 = np.array([0.0, 0.0, s, c])
+    rotated = _quat_mul(q_rot_z90, base)
+    return [base.tolist(), rotated.tolist()]
+
+
+def score_ik_candidate(q, q_start, lower, upper):
+    """
+    Score an IK candidate – **lower is better**.
+
+    score = ||q – q_start||₂  +  0.5 * joint_limit_cost(q)
+
+    The joint-limit cost penalises configurations that are close to their
+    joint limits:
+
+        joint_limit_cost = Σ  |q_i – midpoint_i| / half_range_i
+
+    so every joint contributes a number in [0, 1] where 0 is at the midpoint
+    and 1 is at the limit.
+
+    Args:
+        q:       candidate config, array-like of length n
+        q_start: current/start config, array-like of length n
+        lower:   lower joint limits, array-like of length n
+        upper:   upper joint limits, array-like of length n
+
+    Returns:
+        float – combined cost (distance-to-start + limit penalty)
+    """
+    q       = np.array(q,       dtype=float)
+    q_start = np.array(q_start, dtype=float)
+    lower   = np.array(lower,   dtype=float)
+    upper   = np.array(upper,   dtype=float)
+
+    dist_to_start = np.linalg.norm(q - q_start)
+
+    midpoint   = (lower + upper) / 2.0
+    half_range = (upper - lower) / 2.0
+    # Avoid division by zero for fixed joints (range == 0)
+    half_range = np.where(half_range > 1e-6, half_range, 1.0)
+    limit_cost = np.sum(np.abs(q - midpoint) / half_range)
+
+    return float(dist_to_start + 0.5 * limit_cost)
+
+
+def sample_ik_candidates(robot, planner, pos, base_orn,
+                          q_start=None,
+                          num_seeds_per_yaw=15,
+                          pos_tol=0.01,
+                          orn_tol=0.05,
+                          top_n=5,
+                          dedup_tol=0.05):
+    """
+    Generate and rank IK candidates for a cube pick grasp.
+
+    Tries **exactly two yaw variants** (0° and 90° about world Z relative to
+    ``base_orn``) with ``num_seeds_per_yaw`` random IK seeds each.  Each
+    candidate is checked for:
+
+    1. Joint bound satisfaction
+    2. FK accuracy (position + orientation within tolerances)
+    3. Collision freedom (via ``planner.is_state_valid_list``)
+
+    Candidates are then scored with :func:`score_ik_candidate` and the best
+    ``top_n`` are returned.
+
+    Args:
+        robot:             Robot object with arm_controllable_joints, arm_lower_limits,
+                           arm_upper_limits, eef_id, id.
+        planner:           ``RobotOMPLPlanner`` instance (used for collision checking).
+        pos:               Target EEF position [x, y, z].
+        base_orn:          Base orientation quaternion [x, y, z, w].  One of the
+                           two yaw variants is this quaternion; the other is
+                           rotated 90° about world Z.
+        q_start:           Current joint configuration used for scoring.  If
+                           ``None``, the robot's actual current state is used.
+        num_seeds_per_yaw: Number of random IK seeds tried for each yaw variant
+                           (default 15, so 30 attempts total).
+        pos_tol:           Max allowed FK position error in metres (default 1 cm).
+        orn_tol:           Max allowed FK orientation error in radians (default
+                           ~2.9°).
+        top_n:             Maximum number of candidates returned (default 5).
+        dedup_tol:         Two candidates closer than this L2 distance (radians)
+                           are treated as duplicates; only the better-scored one
+                           is kept (default 0.05 rad).
+
+    Returns:
+        list of joint-config lists, sorted best-first (empty list if none found).
+
+    Example::
+
+        candidates = sample_ik_candidates(robot, planner, pos, base_orn,
+                                          q_start=current_joints)
+        success, path = planner.plan(start_joints, candidates)
+    """
+    lower    = np.array(robot.arm_lower_limits)
+    upper    = np.array(robot.arm_upper_limits)
+    n_joints = len(robot.arm_controllable_joints)
+
+    if q_start is None:
+        q_start = [p.getJointState(robot.id, j)[0]
+                   for j in robot.arm_controllable_joints]
+    q_start = np.array(q_start)
+
+    yaw_variants = _two_yaw_variants(base_orn)
+    rest_poses   = getattr(robot, 'arm_rest_poses',
+                           [0.0] * n_joints)
+
+    candidates = []  # list of (score, config)
+
+    for yaw_idx, orn in enumerate(yaw_variants):
+        yaw_label = ["cube-X axis", "cube-Y axis"][yaw_idx]
+        found = 0
+        for seed_idx in range(num_seeds_per_yaw):
+            # First seed: use rest pose; subsequent: random
+            if seed_idx == 0:
+                seed = rest_poses
+            else:
+                seed = (lower + np.random.rand(n_joints) * (upper - lower)).tolist()
+
+            for i, j in enumerate(robot.arm_controllable_joints):
+                p.resetJointState(robot.id, j, seed[i])
+
+            q_raw = p.calculateInverseKinematics(
+                robot.id, robot.eef_id, pos, orn,
+                lowerLimits=robot.arm_lower_limits,
+                upperLimits=robot.arm_upper_limits,
+                jointRanges=[upper[i] - lower[i] for i in range(n_joints)],
+                restPoses=rest_poses,
+                maxNumIterations=200,
+                residualThreshold=1e-5,
+            )
+            q = list(q_raw[:n_joints])
+
+            # 1. Bounds check
+            q_arr = np.array(q)
+            if np.any(q_arr < lower - 1e-4) or np.any(q_arr > upper + 1e-4):
+                continue
+            q = np.clip(q_arr, lower, upper).tolist()
+
+            # 2. FK verification
+            for i, j in enumerate(robot.arm_controllable_joints):
+                p.resetJointState(robot.id, j, q[i])
+            eef_state  = p.getLinkState(robot.id, robot.eef_id,
+                                        computeForwardKinematics=True)
+            actual_pos = np.array(eef_state[4])
+            actual_orn = np.array(eef_state[5])
+
+            pos_err = np.linalg.norm(actual_pos - np.array(pos))
+            dot     = np.clip(abs(np.dot(actual_orn, np.array(orn))), 0.0, 1.0)
+            orn_err = 2.0 * np.arccos(dot)
+
+            if pos_err > pos_tol or orn_err > orn_tol:
+                continue
+
+            # 3. Collision check
+            if not planner.is_state_valid_list(q):
+                continue
+
+            score = score_ik_candidate(q, q_start, lower, upper)
+            candidates.append((score, q))
+            found += 1
+
+        print(f"  IK sampling ({yaw_label}): {found} collision-free candidates")
+
+    if not candidates:
+        print("  ✗ sample_ik_candidates: no valid IK found for either yaw variant")
+        return []
+
+    # Sort by score (best = lowest) and deduplicate near-identical configs
+    candidates.sort(key=lambda x: x[0])
+    ranked = []
+    for _, q in candidates:
+        q_arr = np.array(q)
+        duplicate = any(np.linalg.norm(q_arr - np.array(r)) < dedup_tol for r in ranked)
+        if not duplicate:
+            ranked.append(q)
+        if len(ranked) >= top_n:
+            break
+
+    print(f"  ✓ sample_ik_candidates: returning {len(ranked)} ranked candidates")
+    return ranked
 
 
 def visualise_eef_traj(current_eef_pos, prev_line_id=None):
@@ -397,85 +666,206 @@ class RobotOMPLPlanner:
     
     def plan(self, start_config, goal_config, planning_time=10.0):
         """
-        Plan a path from start to goal configuration.
-        
+        Plan a path from start to goal configuration(s).
+
+        Supports two calling conventions:
+
+        1. **Single goal** (original / backward-compatible)::
+
+               success, path = planner.plan(start, goal_config)
+
+        2. **Multiple goals** (new) – pass a list of joint configurations.
+           They are tried in the given order (best-first when produced by
+           :func:`sample_ik_candidates`).  Planning stops as soon as one
+           goal succeeds::
+
+               candidates = sample_ik_candidates(robot, planner, pos, orn,
+                                                  q_start=start)
+               success, path = planner.plan(start, candidates)
+
+        For each goal the method first attempts a fast **RRTConnect** solve
+        (``planning_time / 2``).  If RRTConnect fails it retries with the
+        planner set via :meth:`set_planner` using the full ``planning_time``.
+        This two-stage fallback mirrors a MoveIt-style pipeline and
+        significantly reduces "path not found" failures.
+
         Args:
-            start_config: List of joint angles (start)
-            goal_config: List of joint angles (goal)
-            planning_time: Max planning time in seconds
-            
+            start_config:  List of joint angles (start).
+            goal_config:   Either a flat list of joint angles (single goal) or
+                           a list of such lists (multiple goals).
+            planning_time: Max planning time **per goal attempt** in seconds.
+
         Returns:
-            (success, path): Tuple of (bool, list of configs or None)
-                            - (True, path) if planning succeeds
-                            - (False, None) if planning fails
+            ``(success, path)`` – ``(True, list_of_configs)`` on success,
+            ``(False, None)`` on failure.
         """
         if self.planner is None:
             print("✗ Error: No planner set. Call set_planner() first.")
             return False, None
-        
+
+        # ── Normalise goal_config to a list of configs ────────────────────────
+        # A single config is a flat list/array of numbers; every element is a
+        # scalar (int/float/numpy scalar).  Multiple configs is a list-of-lists
+        # or list-of-arrays; the first element is itself a sequence.
+        if (len(goal_config) > 0 and
+                isinstance(goal_config[0], (list, np.ndarray))):
+            # List of configs → multiple goals
+            goal_configs = list(goal_config)
+        else:
+            # Flat list of numbers → single goal
+            goal_configs = [goal_config]
+
         # Save current robot state to restore after planning
         self._save_robot_state()
-        
-        # Clear previous planning data
-        self.ss.clear()
-        
-        # Validate start/goal
+
+        # ── Validate start ────────────────────────────────────────────────────
         if not self.is_state_valid_list(start_config):
             print("✗ Start configuration is in collision!")
             self._restore_robot_state()
             return False, None
-        
-        if not self.is_state_valid_list(goal_config):
-            print("✗ Goal configuration is in collision!")
-            self._restore_robot_state()
-            return False, None
-        
-        # Set start state
-        start = ob.State(self.space)
-        for i in range(self.n_joints):
-            start[i] = start_config[i]
-        
-        # Set goal state
-        goal = ob.State(self.space)
-        for i in range(self.n_joints):
-            goal[i] = goal_config[i]
-        
-        self.ss.setStartAndGoalStates(start, goal)
-        
-        print(f"\nPlanning with {self.planner_type}...")
-        print(f"  Start: {[f'{x:.2f}' for x in start_config]}")
-        print(f"  Goal:  {[f'{x:.2f}' for x in goal_config]}")
-        
-        # Solve
-        start_time = time.time()
-        solved = self.ss.solve(planning_time)
-        elapsed = time.time() - start_time
-        
-        # Restore robot state after planning
+
+        si = self.ss.getSpaceInformation()
+        # Minimum time for the RRTConnect feasibility probe (seconds).
+        _MIN_PROBE_TIME = 5.0
+
+        for goal_idx, gc in enumerate(goal_configs):
+            print(f"\nPlanning attempt {goal_idx + 1}/{len(goal_configs)}")
+            print(f"  Start: {[f'{x:.2f}' for x in start_config]}")
+            print(f"  Goal:  {[f'{x:.2f}' for x in gc]}")
+
+            if not self.is_state_valid_list(gc):
+                print(f"  ✗ Goal {goal_idx + 1} is in collision, skipping")
+                continue
+
+            # Build OMPL start / goal states
+            ompl_start = ob.State(self.space)
+            for i in range(self.n_joints):
+                ompl_start[i] = start_config[i]
+
+            ompl_goal = ob.State(self.space)
+            for i in range(self.n_joints):
+                ompl_goal[i] = gc[i]
+
+            # ── Stage 1: fast RRTConnect feasibility probe ─────────────────
+            # Skip the probe if the primary planner is already RRTConnect.
+            path_list = None
+            if self.planner_type != "RRTConnect":
+                probe_planner = og.RRTConnect(si)
+                self.ss.clear()
+                self.ss.setPlanner(probe_planner)
+                self.ss.setStartAndGoalStates(ompl_start, ompl_goal)
+                probe_time = max(planning_time / 2.0, _MIN_PROBE_TIME)
+                print(f"  [Stage 1] RRTConnect probe ({probe_time:.1f}s)...")
+                t0      = time.time()
+                solved  = self.ss.solve(probe_time)
+                elapsed = time.time() - t0
+                if solved:
+                    self.ss.simplifySolution()
+                    path_obj = self.ss.getSolutionPath()
+                    path_obj.interpolate()
+                    path_list = [[path_obj.getState(i)[j]
+                                  for j in range(self.n_joints)]
+                                 for i in range(path_obj.getStateCount())]
+                    print(f"  ✓ RRTConnect found path: {len(path_list)} wp "
+                          f"in {elapsed:.2f}s")
+                else:
+                    print(f"  ✗ RRTConnect probe failed ({elapsed:.2f}s)")
+                # Restore primary planner for Stage 2
+                self.ss.setPlanner(self.planner)
+
+            # ── Stage 2: primary planner (if Stage 1 failed) ──────────────
+            if path_list is None:
+                self.ss.clear()
+                self.ss.setPlanner(self.planner)
+                self.ss.setStartAndGoalStates(ompl_start, ompl_goal)
+                print(f"  [Stage 2] {self.planner_type} ({planning_time:.1f}s)...")
+                t0      = time.time()
+                solved  = self.ss.solve(planning_time)
+                elapsed = time.time() - t0
+                if solved:
+                    self.ss.simplifySolution()
+                    path_obj = self.ss.getSolutionPath()
+                    path_obj.interpolate()
+                    path_list = [[path_obj.getState(i)[j]
+                                  for j in range(self.n_joints)]
+                                 for i in range(path_obj.getStateCount())]
+                    print(f"  ✓ {self.planner_type} found path: "
+                          f"{len(path_list)} wp in {elapsed:.2f}s")
+                else:
+                    print(f"  ✗ {self.planner_type} failed ({elapsed:.2f}s)")
+
+            if path_list is not None:
+                self._restore_robot_state()
+                print(f"✓ Path found via goal {goal_idx + 1}/{len(goal_configs)}: "
+                      f"{len(path_list)} waypoints")
+                return True, path_list
+
+        # All goals exhausted
         self._restore_robot_state()
-        
-        if solved:
-            # Simplify path
-            self.ss.simplifySolution()
-            
-            # Extract path
-            path_obj = self.ss.getSolutionPath()
-            # This removes redundant waypoints and tries to pull 
-            # the path away from obstacle corners
-            path_obj.interpolate() # Ensures dense points for execution
-            
-            # Convert to list of configurations
-            path_list = []
-            for i in range(path_obj.getStateCount()):
-                state = path_obj.getState(i)
-                config = [state[j] for j in range(self.n_joints)]
-                path_list.append(config)
-            
-            print(f"✓ Path found: {len(path_list)} waypoints in {elapsed:.2f}s")
-            return True, path_list
-        else:
-            print(f"✗ No path found within {planning_time}s (elapsed: {elapsed:.2f}s)")
+        print(f"✗ No path found for any of {len(goal_configs)} goal(s)")
+        return False, None
+
+    def plan_to_pose(self, start_config, pos, base_orn,
+                     planning_time=10.0,
+                     num_seeds_per_yaw=15,
+                     pos_tol=0.01,
+                     orn_tol=0.05,
+                     top_n=5):
+        """
+        High-level API: plan to an end-effector pose using cube X/Y yaw only.
+
+        This method combines IK sampling (:func:`sample_ik_candidates`) with
+        multi-goal planning (:meth:`plan`) in a single call.  It generates
+        exactly **two yaw variants** (grasp aligned with cube X axis and cube
+        Y axis) and tries the best-scored IK candidates until planning
+        succeeds.
+
+        Args:
+            start_config:      Current joint configuration (list of floats,
+                               length = DOF).
+            pos:               Target EEF position [x, y, z].
+            base_orn:          Base orientation quaternion [x, y, z, w].  The
+                               two yaw variants are this and a 90° rotation
+                               about world Z.
+            planning_time:     Max time per planning attempt (seconds).
+            num_seeds_per_yaw: IK seeds tried per yaw variant (default 15).
+            pos_tol:           FK position tolerance in metres (default 1 cm).
+            orn_tol:           FK orientation tolerance in radians (default
+                               ~2.9°).
+            top_n:             Max IK candidates passed to planner (default 5).
+
+        Returns:
+            ``(success, path)`` – same as :meth:`plan`.
+
+        Example::
+
+            # Grasp a cube; try both cube-X and cube-Y yaw automatically
+            success, path = planner.plan_to_pose(
+                start_config=robot.get_arm_joints(),
+                pos=cube_pos + [0, 0, 0.15],   # pre-grasp offset
+                base_orn=p.getQuaternionFromEuler([np.pi, 0, cube_yaw]),
+            )
+        """
+        print(f"\n{'='*60}")
+        print(f"plan_to_pose  pos={[f'{x:.3f}' for x in pos]}")
+        print(f"  Generating IK candidates (X & Y yaw, {num_seeds_per_yaw} "
+              f"seeds/yaw, top_n={top_n})...")
+        print(f"{'='*60}")
+
+        candidates = sample_ik_candidates(
+            self.robot, self, pos, base_orn,
+            q_start=start_config,
+            num_seeds_per_yaw=num_seeds_per_yaw,
+            pos_tol=pos_tol,
+            orn_tol=orn_tol,
+            top_n=top_n,
+        )
+
+        if not candidates:
+            print("✗ plan_to_pose: IK sampling produced no candidates")
             return False, None
+
+        return self.plan(start_config, candidates, planning_time=planning_time)
     
     def execute(self, path, dt=1/240, steps_per_waypoint=100):
         """
