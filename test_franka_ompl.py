@@ -10,7 +10,10 @@ import pybullet_data
 import numpy as np
 import time
 
-from planner import FrankaRobot, RobotOMPLPlanner, solve_ik_collision_free
+import yaml
+from franka_robot import FrankaRobot
+from planner import  RobotOMPLPlanner, solve_ik_collision_free
+import yaml
 
 
 def create_box(position, size=[0.1,0.1,0.1], color=[1,0,0,1]):
@@ -227,12 +230,16 @@ def main():
     print("\n" + "="*60)
     print("CREATING OMPL PLANNER")
     print("="*60)
+    with open("config/planner_config.yaml", 'r') as f:
+        planner_config = yaml.safe_load(f)
     planner = RobotOMPLPlanner(
         robot=robot,
         robot_urdf="franka_panda/panda.urdf",
         obstacles=obstacles,
         collision_margin=0.02,
-        ignore_base=True
+        ignore_base=True,
+        config=planner_config,
+
     )
     
     # Disable collision between collision robot and table (robot is mounted on table)

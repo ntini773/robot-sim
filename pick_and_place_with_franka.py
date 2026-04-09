@@ -13,7 +13,7 @@ import fpsample
 
 import ompl.base as ob
 import ompl.geometric as og
-from planner import RobotOMPLPlanner, solve_ik_collision_free, solve_ik, visualise_eef_traj
+from planner_with_collision_robot import RobotOMPLPlanner, solve_ik_collision_free, solve_ik, visualise_eef_traj
 
 CUBE_LENGTH = 0.05
 
@@ -272,7 +272,7 @@ def interpolate_gripper(robot, target_angle,
                 robot.id, fid,
                 p.POSITION_CONTROL,
                 targetPosition=finger_target,
-                force=500,
+                force=200,
             )
 
         update_simulation(
@@ -316,6 +316,18 @@ def create_cylinder(radius, height, pos, color=[0.7, 0.7, 0.7, 1]):
         baseCollisionShapeIndex=col,
         baseVisualShapeIndex=vis,
         basePosition=[pos[0], pos[1], pos[2] + height / 2],
+    )
+
+
+def create_obstacle_box(half_extents, pos, color=[0.8, 0.2, 0.2, 1]):
+    """Create a static solid-box obstacle sitting on the table."""
+    vis = p.createVisualShape(p.GEOM_BOX, halfExtents=half_extents, rgbaColor=color)
+    col = p.createCollisionShape(p.GEOM_BOX, halfExtents=half_extents)
+    return p.createMultiBody(
+        baseMass=0,
+        baseCollisionShapeIndex=col,
+        baseVisualShapeIndex=vis,
+        basePosition=pos,
     )
 
 
@@ -501,6 +513,87 @@ def update_simulation(
 # MOTION HELPERS
 # =============================================================================
 
+def best_down_orn(robot, target_pos, n_yaws=4, obstacle_xys=None):
+    """
+    Return the gripper-down quaternion (roll=π, pitch=0, yaw=free) that:
+
+    1. Has a valid IK solution within joint limits.
+    2. Minimises joint-space travel from the current arm configuration.
+    3. (When obstacle_xys provided) Orients the finger-spread axis toward
+       the most laterally open direction around target_pos.
+
+    For Franka panda the fingers open along the hand's local-X axis, which
+    maps to world direction [cos(yaw), sin(yaw)] when roll=π, pitch=0.
+    We therefore prefer the yaw whose finger axis is perpendicular to the
+    dominant obstacle direction — i.e. the cube's 'open' side.
+    """
+    current_q = np.array([p.getJointState(robot.id, j)[0]
+                           for j in robot.arm_controllable_joints])
+    yaw_angles = np.linspace(0, 2 * math.pi, n_yaws, endpoint=False)
+
+    lower = np.array(robot.arm_lower_limits)
+    upper = np.array(robot.arm_upper_limits)
+    joint_range_sum = float(np.sum(upper - lower)) + 1e-8
+
+    # ── Compute the 2-D "free" direction around target_pos ──────────────────
+    # Each nearby obstacle pushes a repulsion vector toward the cube.
+    # The free finger-spread axis is PERPENDICULAR to the net repulsion,
+    # i.e. along the axis the cube is *not* blocked on.
+    free_dir = np.array([1.0, 0.0])          # default: align fingers with world-X
+    if obstacle_xys and len(obstacle_xys) > 0:
+        txy = np.array(target_pos[:2])
+        repulsion = np.zeros(2)
+        for oxy in obstacle_xys:
+            diff = txy - np.array(oxy[:2])
+            d = np.linalg.norm(diff)
+            if d > 1e-3:
+                repulsion += diff / (d * d)   # weight closer obstacles more
+        norm_rep = np.linalg.norm(repulsion)
+        if norm_rep > 1e-3:
+            dom = repulsion / norm_rep        # dominant obstacle direction
+            # free axis = perpendicular to dominant obstacle direction
+            free_dir = np.array([-dom[1], dom[0]])
+
+    best_orn  = p.getQuaternionFromEuler([math.pi, 0.0, 0.0])  # fallback
+    best_score = float("inf")
+
+    for yaw in yaw_angles:
+        orn = p.getQuaternionFromEuler([math.pi, 0.0, yaw])
+        q = p.calculateInverseKinematics(
+            robot.id, robot.eef_id,
+            target_pos, orn,
+            lowerLimits=robot.arm_lower_limits,
+            upperLimits=robot.arm_upper_limits,
+            jointRanges=robot.arm_joint_ranges,
+            restPoses=robot.arm_rest_poses,
+            maxNumIterations=100,
+            residualThreshold=1e-5,
+        )
+        q = np.array(q[:robot.arm_num_dofs])
+        if np.any(q < lower - 1e-3) or np.any(q > upper + 1e-3):
+            continue
+
+        # ── Joint-travel term (0 = current pose, 1 = full joint range away) ─
+        joint_term = np.linalg.norm(q - current_q) / joint_range_sum
+
+        # ── Clearance term: how well the finger axis aligns with free_dir ───
+        # Panda fingers spread along hand local-X → world [cos(yaw), sin(yaw)]
+        finger_dir = np.array([math.cos(yaw), math.sin(yaw)])
+        # |dot| because spreading in +free or -free is both fine
+        alignment = abs(float(np.dot(finger_dir, free_dir)))
+        clearance_term = 1.0 - alignment          # 0 = perfectly aligned
+
+        # Combined score — lower is better.
+        # Weight clearance higher so it dominates when cube is near obstacles.
+        score = joint_term + 1.5 * clearance_term
+
+        if score < best_score:
+            best_score = score
+            best_orn   = orn
+
+    return best_orn
+
+
 def move_to_pose_dynamic(robot, target_pos, target_orn,
                           max_steps=200, capture_frames=False,
                           iter_folder=None, frame_counter=None,
@@ -528,6 +621,7 @@ def move_with_planner(planner, robot, target_pos, target_orn,
         return False
 
     planner._snapshot_gripper_pose()
+    val = p.getJointState(robot.id, robot.mimic_parent_id)[0]
     success, path = planner.plan(start_config, goal_config, planning_time=10.0)
     planner._apply_frozen_gripper_printing()
 
@@ -554,11 +648,12 @@ def move_with_planner(planner, robot, target_pos, target_orn,
         visualise_eef_traj(eef_state[0])
 
         for _ in range(max_steps_per_waypoint):
+            print("GRIPPER DEBUG INFO:{}".format(p.getJointState(robot.id, robot.mimic_parent_id)[0]))
             # Hold gripper throughout motion
             for fid in robot.finger_joint_ids:
                 p.setJointMotorControl2(
                     robot.id, fid, p.POSITION_CONTROL,
-                    targetPosition=p.getJointState(robot.id, robot.mimic_parent_id)[0],
+                    targetPosition=val,
                     force=500,
                 )
             update_simulation(1, robot=robot, capture_frames=capture_frames,
@@ -615,26 +710,71 @@ def move_and_grab_cube(robot, table_id, plane_id,
 
     cube_id     = None
     cylinder_id = None
+    obstacle_ids = []  # two static box obstacles per iteration
+
+    # Fixed obstacle geometry: 8 cm × 8 cm base, 12 cm tall
+    # Kept moderate to avoid collisions at the robot's start configuration.
+    OBS_HALF = [0.04, 0.04, 0.1]
+    TABLE_Z  = 0.625  # table surface height
+    OBS_COLORS = [
+        [0.85, 0.20, 0.20, 1.0],   # red
+        [0.20, 0.20, 0.85, 1.0],   # blue
+    ]
+    HOME_XY = np.array([0.40, 0.00])
+    MIN_HOME_CLEARANCE = 0.22
+    MIN_OBS_PAIR_DIST = 0.18
 
     while successful_iterations < 150:
         temp_folder = os.path.join(base_save_dir, f"temp_iter_{total_attempts:04d}")
         os.makedirs(temp_folder, exist_ok=True)
 
         # Clean up previous bodies
-        for bid in [cube_id, cylinder_id]:
+        for bid in [cube_id, cylinder_id] + obstacle_ids:
             if bid is not None:
                 try:
                     p.removeBody(bid)
                 except Exception:
                     pass
         cube_id = cylinder_id = None
+        obstacle_ids = []
+
+        # ------------------------------------------------------------------
+        # Spawn 2 random box obstacles on the table (act as path blockers)
+        # Keep them clear of the robot home/start region to avoid
+        # "start configuration is in collision" planning failures.
+        # ------------------------------------------------------------------
+        def sample_obstacle_xy(x_rng, y_rng, existing_xy):
+            for _ in range(40):
+                cand = np.array([
+                    random.uniform(*x_rng),
+                    random.uniform(*y_rng),
+                ])
+                if np.linalg.norm(cand - HOME_XY) < MIN_HOME_CLEARANCE:
+                    continue
+                if any(np.linalg.norm(cand - prev) < MIN_OBS_PAIR_DIST for prev in existing_xy):
+                    continue
+                return cand
+            return np.array([np.mean(x_rng), np.mean(y_rng)])
+
+        obs_xy = []
+        obs_xy.append(sample_obstacle_xy((0.48, 0.75), (-0.26, -0.12), obs_xy))
+        obs_xy.append(sample_obstacle_xy((0.48, 0.78), (0.12, 0.26), obs_xy))
+
+        obs_positions = [
+            [xy[0], xy[1], TABLE_Z + OBS_HALF[2]]
+            for xy in obs_xy
+        ]
+        for i, (obs_pos, obs_col) in enumerate(zip(obs_positions, OBS_COLORS)):
+            oid = create_obstacle_box(OBS_HALF, obs_pos, color=obs_col)
+            obstacle_ids.append(oid)
+            print(f"Obstacle {i+1} at: {[f'{v:.4f}' for v in obs_pos]}")
 
         # Spawn target cylinder
         target_radius = 0.05
         target_height = 0.04
         tray_pos = [
-            random.uniform(0.25, 0.45),
-            random.uniform(0.10, 0.25),
+            random.uniform(0.25, 0.8),
+            random.uniform(-0.25, 0.25),
             0.625,
         ]
         cylinder_id = create_cylinder(target_radius, target_height, tray_pos,
@@ -654,8 +794,8 @@ def move_and_grab_cube(robot, table_id, plane_id,
 
         # Spawn cube
         cube_start_pos = [
-            random.uniform(0.20, 0.40),
-            random.uniform(-0.15, 0.10),
+            random.uniform(0.20, 0.80),
+            random.uniform(-0.22, 0.12),
             0.65,
         ]
         cube_id = p.loadURDF("cube_small.urdf", cube_start_pos,
@@ -665,8 +805,6 @@ def move_and_grab_cube(robot, table_id, plane_id,
         p.changeVisualShape(cube_id, -1, rgbaColor=[0, 0, 0, 1])
         print(f"Cube at: {[f'{v:.4f}' for v in cube_start_pos]}")
 
-        _, eef_orientation = robot.get_current_ee_position()
-
         # ------------------------------------------------------------------
         # Build planners (two instances, different obstacle sets)
         # planner1: approach cube  — cube in obstacles so arm doesn't hit it
@@ -675,7 +813,7 @@ def move_and_grab_cube(robot, table_id, plane_id,
         planner1 = RobotOMPLPlanner(
             robot=robot,
             robot_urdf="franka_panda/panda.urdf",
-            obstacles=[table_id, cube_id],
+            obstacles=[table_id, cube_id] + obstacle_ids,
             collision_margin=0.02,
             ignore_base=True,
         )
@@ -684,7 +822,7 @@ def move_and_grab_cube(robot, table_id, plane_id,
         planner2 = RobotOMPLPlanner(
             robot=robot,
             robot_urdf="franka_panda/panda.urdf",
-            obstacles=[table_id, cylinder_id],
+            obstacles=[table_id, cylinder_id] + obstacle_ids,
             collision_margin=0.02,
             ignore_base=True,
         )
@@ -699,14 +837,18 @@ def move_and_grab_cube(robot, table_id, plane_id,
             EXCLUDE_TABLE=EXCLUDE_TABLE,
         )
 
+        # XY centres of static obstacles — used for clearance-aware wrist yaw
+        obs_xys = [op[:2] for op in obs_positions]
+
         # ------------------------------------------------------------------
         # Phase 1: Move above cube (planner — avoids cube)
         # ------------------------------------------------------------------
         print("Phase 1: Moving above cube...")
+        above_cube = [cube_start_pos[0], cube_start_pos[1], 0.80]
+        orn_above_cube = best_down_orn(robot, above_cube, obstacle_xys=obs_xys)
         move_with_planner(
             planner1, robot,
-            [cube_start_pos[0], cube_start_pos[1], 0.80],
-            eef_orientation,
+            above_cube, orn_above_cube,
             **common_kwargs,
         )
         step1_history = state_history.copy()
@@ -715,13 +857,14 @@ def move_and_grab_cube(robot, table_id, plane_id,
         # Phase 2: Move down to grasp (closed-loop IK, no planner)
         # ------------------------------------------------------------------
         print("Phase 2: Moving down to grasp...")
+        grasp_pos = [cube_start_pos[0], cube_start_pos[1], 0.645]
+        orn_grasp = best_down_orn(robot, grasp_pos, obstacle_xys=obs_xys)
         move_to_pose_dynamic(
             robot,
-            [cube_start_pos[0], cube_start_pos[1], 0.645],
-            eef_orientation,
+            grasp_pos, orn_grasp,
             **common_kwargs,
         )
-        # planner1.cleanup()
+        planner1.cleanup()
         step2_history = state_history.copy()
 
         # ------------------------------------------------------------------
@@ -735,10 +878,11 @@ def move_and_grab_cube(robot, table_id, plane_id,
         # Phase 4: Lift cube
         # ------------------------------------------------------------------
         print("Phase 4: Lifting cube...")
+        lift_pos = [cube_start_pos[0], cube_start_pos[1], 0.80]
+        orn_lift = best_down_orn(robot, lift_pos, obstacle_xys=obs_xys)
         move_to_pose_dynamic(
             robot,
-            [cube_start_pos[0], cube_start_pos[1], 0.80],
-            eef_orientation,
+            lift_pos, orn_lift,
             **common_kwargs,
         )
         step4_history = state_history.copy()
@@ -755,9 +899,10 @@ def move_and_grab_cube(robot, table_id, plane_id,
         ]
         print(f"  Target: {[f'{v:.4f}' for v in target_drop_pos]}")
 
+        orn_drop = best_down_orn(robot, target_drop_pos)
         move_with_planner(
             planner2, robot,
-            target_drop_pos, eef_orientation,
+            target_drop_pos, orn_drop,
             **common_kwargs,
         )
         step5_history = state_history.copy()
@@ -768,7 +913,7 @@ def move_and_grab_cube(robot, table_id, plane_id,
         print("Phase 6: Opening gripper...")
         interpolate_gripper(robot, target_angle=0.0, **common_kwargs)
         step6_history = state_history.copy()
-        # planner2.cleanup()
+        planner2.cleanup()
 
         # ------------------------------------------------------------------
         # Phase 7: Settle
@@ -913,12 +1058,13 @@ def move_and_grab_cube(robot, table_id, plane_id,
             failed_attempts += 1
 
         # Remove bodies for next iteration
-        for bid in [cube_id, cylinder_id]:
+        for bid in [cube_id, cylinder_id] + obstacle_ids:
             try:
                 p.removeBody(bid)
             except Exception:
                 pass
         cube_id = cylinder_id = None
+        obstacle_ids = []
 
         total_attempts += 1
 

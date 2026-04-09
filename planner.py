@@ -4,7 +4,8 @@ Simple OMPL Motion Planner - Uses visible robot for collision checking
 Interface similar to pybullet_ompl with visible collision checking for easy debugging.
 
 Usage:
-    from planner import RobotOMPLPlanner, FrankaRobot, solve_ik_collision_free
+    from franka_robot import FrankaRobot
+    from planner import RobotOMPLPlanner, solve_ik_collision_free
     
     # Setup robot and environment
     robot = FrankaRobot([0, 0, 0.63], [0, 0, 0])
@@ -85,26 +86,27 @@ def solve_ik(robot, planner, pos, orn):
             residualThreshold=1e-5
         )
     return q
-
-def solve_ik_collision_free(robot, planner, pos, orn, max_attempts=50,
-                             pos_tol=0.01, orn_tol=0.05):
-    """
-    Solve IK with collision checking, bounds validation, and FK verification.
-    
-    Args:
-        pos_tol: Max allowed EEF position error in metres (default 1cm)
-        orn_tol: Max allowed EEF orientation error in radians (default ~3deg)
-    """
+def solve_ik_collision_free(robot, planner, pos, orn, max_attempts=50, pos_tol=0.05, orn_tol=0.05):
+    """Solve IK with proper seeding to avoid twisted wrist configurations."""
     lower = np.array(robot.arm_lower_limits)
     upper = np.array(robot.arm_upper_limits)
     
     for attempt in range(max_attempts):
-        # Use random seed after first attempt
-        if attempt > 0:
-            seed = lower + np.random.rand(len(robot.arm_controllable_joints)) * (upper - lower)
-            for i, j in enumerate(robot.arm_controllable_joints):
-                p.resetJointState(robot.id, j, seed[i])
-        
+        # --- PROPER SEEDING LOGIC ---
+        if attempt == 0:
+            # First try: Force the solver to start from the "Ideal" posture
+            seed = getattr(robot, 'arm_rest_poses', [0.0] * len(robot.arm_controllable_joints))
+        else:
+            # Subsequent tries: Add small random noise to escape local minima
+            rest = np.array(getattr(robot, 'arm_rest_poses', [0.0] * len(robot.arm_controllable_joints)))
+            noise = np.random.uniform(-0.3, 0.3, len(robot.arm_controllable_joints))
+            seed = np.clip(rest + noise, lower, upper)
+            
+        # Manually set the robot to the seed state BEFORE calculating IK
+        for i, j in enumerate(robot.arm_controllable_joints):
+            p.resetJointState(robot.id, j, seed[i])
+        # -------------------------
+
         # Compute IK
         q = p.calculateInverseKinematics(
             robot.id, robot.eef_id, pos, orn,
@@ -113,55 +115,39 @@ def solve_ik_collision_free(robot, planner, pos, orn, max_attempts=50,
             jointRanges=[robot.arm_upper_limits[i] - robot.arm_lower_limits[i]
                          for i in range(len(robot.arm_controllable_joints))],
             restPoses=getattr(robot, 'arm_rest_poses', [0.0] * len(robot.arm_controllable_joints)),
-            maxNumIterations=100,
-            residualThreshold=1e-5
+            maxNumIterations=1000,
+            residualThreshold=1e-6
         )
         q = list(q[:len(robot.arm_controllable_joints)])
         
         # 1. Bounds check
         q_array = np.array(q)
         if np.any(q_array < lower - 1e-4) or np.any(q_array > upper + 1e-4):
-            if attempt == 0:
-                print(f"  ⚠ IK violates bounds, retrying...")
             continue
         q = np.clip(q_array, lower, upper).tolist()
         
-        # 2. ── FK VERIFICATION ──────────────────────────────────────────────
-        # Apply joints and read back actual EEF pose via forward kinematics.
-        # PyBullet IK can silently fail (joint limits, singularities, etc.)
-        # and return a solution that puts the EEF nowhere near the target.
+        # 2. FK Verification
         for i, j in enumerate(robot.arm_controllable_joints):
             p.resetJointState(robot.id, j, q[i])
         
-        eef_state   = p.getLinkState(robot.id, robot.eef_id,computeForwardKinematics=True)
-        actual_pos  = np.array(eef_state[4])   # world position  (link frame)
-        actual_orn  = np.array(eef_state[5])   # world quaternion
+        eef_state   = p.getLinkState(robot.id, robot.eef_id, computeForwardKinematics=True)
+        actual_pos  = np.array(eef_state[4])   
+        actual_orn  = np.array(eef_state[5])   
 
         pos_error = np.linalg.norm(actual_pos - np.array(pos))
-
-        # Quaternion angular distance: 2*arccos(|q1·q2|)  (handles q == -q)
-        target_orn  = np.array(orn)
-        dot         = np.clip(abs(np.dot(actual_orn, target_orn)), 0.0, 1.0)
-        orn_error   = 2.0 * np.arccos(dot)
+        dot       = np.clip(abs(np.dot(actual_orn, np.array(orn))), 0.0, 1.0)
+        orn_error = 2.0 * np.arccos(dot)
 
         if pos_error > pos_tol or orn_error > orn_tol:
             if attempt < 3:
-                print(f"  ⚠ FK mismatch (attempt {attempt+1}): "
-                      f"pos_err={pos_error*1000:.1f}mm  "
-                      f"orn_err={np.degrees(orn_error):.1f}°  — retrying")
+                print(f"  ⚠ FK mismatch (attempt {attempt+1}): pos_err={pos_error*1000:.1f}mm")
             continue
-        # ── end FK check ───────────────────────────────────────────────────
 
         # 3. Collision check
         if planner.is_state_valid_list(q):
-            print(f"  ✓ IK valid (attempt {attempt+1}): "
-                  f"pos_err={pos_error*1000:.2f}mm  "
-                  f"orn_err={np.degrees(orn_error):.2f}°")
+            print(f"  ✓ IK valid (attempt {attempt+1}): pos_err={pos_error*1000:.2f}mm")
             return q
-        else:
-            if attempt < 3:
-                planner._debug_collision_state(q)
-    
+            
     print(f"  ✗ No valid IK after {max_attempts} attempts")
     return None
 class RobotOMPLPlanner:
@@ -182,7 +168,7 @@ class RobotOMPLPlanner:
         planner.execute(path)
     """
     
-    def __init__(self, robot, obstacles=None, collision_margin=0.02, ignore_base=True, robot_urdf=None):
+    def __init__(self, robot, obstacles=None,target_obstacle_id=None, collision_margin=0.02, ignore_base=True, robot_urdf=None,config=None):
         """
         Initialize OMPL planner with visible collision checking.
         
@@ -192,11 +178,14 @@ class RobotOMPLPlanner:
             collision_margin: Safety distance from obstacles (meters)
             ignore_base: Ignore base link collisions
             robot_urdf: (Ignored, for compatibility with old interface)
+            config: Dictionary containing planner configuration options
         """
         self.robot = robot
         self.obstacles = obstacles or []
         self.collision_margin = collision_margin
         self.ignore_base = ignore_base
+        self.config = config or {} # Default to empty dict if no config provided
+        self.target_obstacle_id = target_obstacle_id
         
         # Auto-detect DOF from robot
         self.joint_ids = robot.arm_controllable_joints
@@ -240,8 +229,36 @@ class RobotOMPLPlanner:
         
         # Configure space information
         si = self.ss.getSpaceInformation()
-        # si.setStateValidityCheckingResolution(0.01)
-        si.setStateValidityCheckingResolution(0.005) 
+                
+        # APPLY CONFIG: Validity Checking Resolution
+        si.setStateValidityCheckingResolution(self.config['planner'].get('resolution', 0.001))
+
+        # --- NEW: OPTIMIZATION OBJECTIVE ---
+        # This is critical for AIT* and RRT* to actually optimize!
+        if self.config.get('optimization', {}).get('objective') == "PathLength":
+             obj = ob.PathLengthOptimizationObjective(si)
+        elif self.config.get('optimization', {}).get('objective') == "MaximizeMinClearance":
+            obj = ob.MaximizeMinClearanceObjective(si)
+        elif self.config.get('optimization', {}).get('objective') == "MechanicalWork":
+            obj = ob.MechanicalWorkOptimizationObjective(si)
+        elif self.config.get('optimization', {}).get('objective') == "Multi":
+            # --- BLENDED OPTIMIZATION OBJECTIVE ---
+            # 1. Create the Multi-Objective container
+            obj = ob.MultiOptimizationObjective(si)
+            
+            # 2. Create the individual objectives
+            length_obj = ob.PathLengthOptimizationObjective(si)
+            clearance_obj = ob.MaximizeMinClearanceObjective(si)
+            
+            # 3. Add them to the container with weights
+            # Note: We want to MAXIMIZE clearance, but OMPL natively MINIMIZES costs. 
+            # MaximizeMinClearanceObjective handles this inversion internally.
+            # Weighting: 1.0 for length, 5.0 for clearance (tune these based on behavior)
+            obj.addObjective(length_obj, 1.0)
+            obj.addObjective(clearance_obj, 2.0) 
+            
+            # 4. Apply it to the SimpleSetup
+        self.ss.setOptimizationObjective(obj)
 
         
         # Planner will be set via set_planner()
@@ -250,7 +267,7 @@ class RobotOMPLPlanner:
         
         print(f"✓ OMPL planner initialized (call set_planner() to select algorithm)")
         print(f"{'='*60}\n")
-    
+
     def is_state_valid(self, state):
         """
         Check if configuration is collision-free by moving the visible robot.
@@ -261,6 +278,15 @@ class RobotOMPLPlanner:
         # Set arm joints
         for i, joint_id in enumerate(self.joint_ids):
             p.resetJointState(self.robot.id, joint_id, joint_angles[i])
+        # Check some of the ending joints (wrist and EEF) to stay in front of base
+        for link_idx in [5, 6]: 
+            link_state = p.getLinkState(self.robot.id, link_idx)
+            link_pos = link_state[0]
+            
+            # Prevent the wrist from swinging behind the base (x=0) 
+            # 0.13m is a safe 'front-only' buffer for Lite6
+            if link_pos[0] < 0.08: # Reduced from 0.13 to 0.08 as Lite6 is having a forward bias in paths 
+                return False
         
         # ── NEW: freeze gripper so it's always checked at the correct geometry ──
         self._apply_frozen_gripper()
@@ -270,20 +296,51 @@ class RobotOMPLPlanner:
         if self._check_self_collision():
             return False
         
+        # --- 1.2x Dynamic Inflation Strategy ---
+        # We increase the checking distance by 1.2x to ensure wide clearance
+        inflation_factor = self.config.get('inflation_factor', 1.2)
+        inflated_margin = self.collision_margin * inflation_factor
         for obs_id in self.obstacles:
+            # If this obstacle is the thing we are trying to grab, 
+            # we allow the robot to get very close to it (e.g., 1mm margin)
+            if obs_id == self.target_obstacle_id:
+                current_margin = 0.001 
+            else:
+                current_margin = inflated_margin
+
             closest_points = p.getClosestPoints(
                 self.robot.id, obs_id,
-                distance=self.collision_margin
+                distance=current_margin 
             )
+            
             if closest_points:
                 for pt in closest_points:
                     robot_link = pt[3]
                     distance = pt[8]
                     if self.ignore_base and robot_link == -1:
                         continue
-                    if distance < self.collision_margin:
+                        
+                    if distance < current_margin:
                         return False
+        # NEW: Orientation Constraint Check
+        joint_angles = [state[i] for i in range(self.n_joints)]
+        for i, joint_id in enumerate(self.joint_ids):
+            p.resetJointState(self.robot.id, joint_id, joint_angles[i])
+            
+        eef_state = p.getLinkState(self.robot.id, self.robot.eef_id)
+        actual_orn = eef_state[1] # Current quaternion
         
+        # Compare with your 'look down' target orientation
+        target_orn = p.getQuaternionFromEuler([-1.5708, 0, 1.5708])
+        
+        # Calculate angular distance
+        dot = np.clip(abs(np.dot(actual_orn, target_orn)), 0.0, 1.0)
+        angular_dist = 2.0 * np.arccos(dot)
+        
+        # Reject states that tilt more than 15 degrees
+        if angular_dist > np.radians(60):
+            return False
+            
         return True
     # def _save_robot_state(self):
     #     """Save arm + gripper joint state"""
@@ -372,6 +429,11 @@ class RobotOMPLPlanner:
         
         if planner_name == "AITstar":
             self.planner = og.AITstar(si)
+            # self.planner.enablePruning(False)
+            # params = self.planner.params()
+            # params.setParam("use_graph_pruning", "0")    # "0" for False
+            # print(dir(self.planner)) 
+            # self.planner.setPruning(False) 
         elif planner_name == "RRTstar":
             self.planner = og.RRTstar(si)
         elif planner_name == "RRTConnect":
@@ -386,6 +448,8 @@ class RobotOMPLPlanner:
             self.planner = og.BITstar(si)
         elif planner_name == "ABITstar":
             self.planner = og.ABITstar(si)
+        elif planner_name == "EITstar":
+            self.planner = og.EITstar(si)
         else:
             print(f"Warning: Planner '{planner_name}' not recognized, using AITstar")
             self.planner = og.AITstar(si)
@@ -420,15 +484,16 @@ class RobotOMPLPlanner:
         self.ss.clear()
         
         # Validate start/goal
+        if not self.is_state_valid_list(goal_config):
+            print("✗ Goal configuration is in collision!")
+            self._restore_robot_state()
+            return False, None
+        
         if not self.is_state_valid_list(start_config):
             print("✗ Start configuration is in collision!")
             self._restore_robot_state()
             return False, None
         
-        if not self.is_state_valid_list(goal_config):
-            print("✗ Goal configuration is in collision!")
-            self._restore_robot_state()
-            return False, None
         
         # Set start state
         start = ob.State(self.space)
@@ -452,29 +517,57 @@ class RobotOMPLPlanner:
         elapsed = time.time() - start_time
         
         # Restore robot state after planning
-        self._restore_robot_state()
         
+        # UPDATE 2: Modify the execution block inside the plan() function
         if solved:
-            # Simplify path
-            self.ss.simplifySolution()
-            
-            # Extract path
             path_obj = self.ss.getSolutionPath()
-            # This removes redundant waypoints and tries to pull 
-            # the path away from obstacle corners
-            path_obj.interpolate() # Ensures dense points for execution
             
-            # Convert to list of configurations
+            # Check if smoothing is enabled in the config
+            if self.config.get('smoothing', {}).get('enable_smoothing', True):
+                ps = og.PathSimplifier(self.ss.getSpaceInformation())
+                ps.reduceVertices(path_obj)
+                # ps.ropeShortcutPath(path_obj)                
+                # Read from config dict
+                s_steps = self.config['smoothing'].get('smooth_steps', 5)
+                m_change = self.config['smoothing'].get('min_change', 0.01)
+                
+                ps.smoothBSpline(path_obj, maxSteps=s_steps, minChange=m_change)
+            # Read interpolation points
+            i_points = self.config.get('smoothing', {}).get('interpolate_points', 100)
+            path_obj.interpolate(i_points)
+                    
+            # Convert to list
             path_list = []
+            
             for i in range(path_obj.getStateCount()):
                 state = path_obj.getState(i)
                 config = [state[j] for j in range(self.n_joints)]
                 path_list.append(config)
-            
-            print(f"✓ Path found: {len(path_list)} waypoints in {elapsed:.2f}s")
+            # --- THE FIX: CLAMP THE ENDPOINTS ---
+            # Force the first and last waypoints to be the exact, mathematically 
+            # perfect start and goal configurations you already verified.
+            path_list[0] = start_config
+            path_list[-1] = goal_config
+            # THE FOOLPROOF CHECK
+            print("Validating final path points...")
+            path_is_safe = True
+            for i, config in enumerate(path_list):
+                if not self.is_state_valid_list(config):
+                    print(f"✗ COLLISION DETECTED at waypoint {i+1}/{len(path_list)}")
+                    path_is_safe = False
+                    break
+                    
+            if not path_is_safe:
+                print("✗ Planner returned a colliding path. Try increasing interpolate_points.")
+                self._restore_robot_state()
+                return False, None
+                
+            print(f"✓ Path found, smoothed, and verified: {len(path_list)} waypoints in {elapsed:.2f}s")
+            self._restore_robot_state() 
             return True, path_list
         else:
-            print(f"✗ No path found within {planning_time}s (elapsed: {elapsed:.2f}s)")
+            print(f"✗ No path found within {planning_time}s")
+            self._restore_robot_state()  # Ensure robot is back to original state after planning
             return False, None
     
     def execute(self, path, dt=1/240, steps_per_waypoint=100):
@@ -582,99 +675,3 @@ class RobotOMPLPlanner:
     def cleanup(self):
         """No-op — original planner has no ghost bodies to remove."""
         pass
-
-class FrankaRobot:
-    """
-    Simple Franka Panda robot class for testing.
-    Follows same interface pattern as Lite6Robot for compatibility with RobotOMPLPlanner.
-    """
-    
-    def __init__(self, pos, ori):
-        self.base_pos = pos
-        self.base_ori = p.getQuaternionFromEuler(ori)
-        self.eef_id = 11  # Franka EEF link index
-        self.arm_num_dofs = 7
-        self.arm_rest_poses = [0.0, -0.785, 0.0, -2.356, 0.0, 1.571, 0.785]
-        self.max_velocity = 3.0
-        self.id = None
-    
-    def load(self):
-        """Load Franka Panda URDF"""
-        p.setAdditionalSearchPath(pybullet_data.getDataPath())
-        
-        self.id = p.loadURDF(
-            "franka_panda/panda.urdf",
-            self.base_pos,
-            self.base_ori,
-            useFixedBase=True,
-        )
-        
-        self._parse_joint_info()
-        self._print_debug_info()
-    
-    def _parse_joint_info(self):
-        """Parse joint information from URDF"""
-        jointInfo = namedtuple(
-            "jointInfo",
-            ["id", "name", "type", "lowerLimit", "upperLimit", 
-             "maxForce", "maxVelocity", "controllable"],
-        )
-        
-        self.joints = []
-        self.controllable_joints = []
-        
-        for i in range(p.getNumJoints(self.id)):
-            info = p.getJointInfo(self.id, i)
-            jointID = info[0]
-            jointName = info[1].decode("utf-8")
-            jointType = info[2]
-            jointLowerLimit = info[8]
-            jointUpperLimit = info[9]
-            jointMaxForce = info[10]
-            jointMaxVelocity = info[11]
-            controllable = jointType != p.JOINT_FIXED
-            
-            if controllable:
-                self.controllable_joints.append(jointID)
-            
-            self.joints.append(
-                jointInfo(
-                    jointID, jointName, jointType,
-                    jointLowerLimit, jointUpperLimit,
-                    jointMaxForce, jointMaxVelocity,
-                    controllable,
-                )
-            )
-        
-        # First 7 joints are arm, rest are gripper
-        self.arm_controllable_joints = self.controllable_joints[:self.arm_num_dofs]
-        self.arm_lower_limits = [j.lowerLimit for j in self.joints if j.controllable][:self.arm_num_dofs]
-        self.arm_upper_limits = [j.upperLimit for j in self.joints if j.controllable][:self.arm_num_dofs]
-        self.arm_joint_ranges = [
-            ul - ll for ul, ll in zip(self.arm_upper_limits, self.arm_lower_limits)
-        ]
-    
-    def _print_debug_info(self):
-        """Print debug information"""
-        print("\n" + "="*60)
-        print("FRANKA ROBOT DEBUG INFO")
-        print("="*60)
-        jtype_names = {0: 'REVOLUTE', 1: 'PRISMATIC', 4: 'FIXED'}
-        for j in self.joints:
-            jtype = jtype_names.get(j.type, str(j.type))
-            ctrl = "CTRL" if j.controllable else "    "
-            print(f"  Joint {j.id:2d}: {j.name:<35s} ({jtype:<9s}) [{ctrl}]")
-        
-        print(f"\nArm controllable joints: {self.arm_controllable_joints}")
-        print(f"Arm DOF: {self.arm_num_dofs}")
-        print(f"EEF link index: {self.eef_id}")
-        
-        eef_state = p.getLinkState(self.id, self.eef_id)
-        print(f"EEF position: {eef_state[0]}")
-        print(f"EEF orientation (quat): {eef_state[1]}")
-        print("="*60 + "\n")
-    
-    def get_current_ee_position(self):
-        """Get current end-effector pose"""
-        eef_state = p.getLinkState(self.id, self.eef_id)
-        return eef_state[0], eef_state[1]

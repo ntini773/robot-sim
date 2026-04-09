@@ -13,6 +13,7 @@ import pybullet as p
 import pybullet_data
 import numpy as np
 import time
+import yaml
 
 # Import Lite6Robot from existing pick_and_place script
 from pick_and_place_xarm6_gripper import Lite6Robot
@@ -130,7 +131,6 @@ def test_planner(planner_type, robot, planner, obstacles,
     print(f"\n✓ IK solutions found")
     print(f"  Start: {[f'{x:.2f}' for x in start_config]}")
     print(f"  Goal:  {[f'{x:.2f}' for x in goal_config]}")
-    
     # Move robot to start
     for i, joint_id in enumerate(robot.arm_controllable_joints):
         p.resetJointState(robot.id, joint_id, start_config[i])
@@ -264,12 +264,24 @@ def main():
     print("\n" + "="*60)
     print("CREATING OMPL PLANNER")
     print("="*60)
+    yaml_config_path = "./config/planner_config.yaml"
+    try:
+        with open(yaml_config_path, "r") as file:
+            config_dict = yaml.safe_load(file)
+    except FileNotFoundError:
+        print("Warning: planner_config.yaml not found. Using defaults.")
+        config_dict = {
+            'planner': {'algorithm': 'RRTConnect', 'planning_time': 5.0, 'collision_margin': 0.02, 'resolution': 0.005},
+            'smoothing': {'enable_smoothing': True, 'smooth_steps': 10, 'interpolate_points': 150, 'min_change': 0.01},
+            'optimization': {'objective': "PathLength", 'cost_threshold': 1.1}
+        }
     planner = RobotOMPLPlanner(
         robot=robot,
         robot_urdf="./lite-6-updated-urdf/lite_6_new.urdf",
         obstacles=obstacles,
         collision_margin=0.02,
-        ignore_base=True
+        ignore_base=True,
+        config=config_dict
     )
     
     # Disable collision between collision robot and table (robot is mounted on table)

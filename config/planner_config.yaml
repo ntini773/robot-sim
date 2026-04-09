@@ -1,0 +1,34 @@
+# ==========================================
+# OMPL Planner Configuration for xArm Lite6
+# ==========================================
+
+planner:
+  algorithm: "AITstar"        # BITstar or InformedRRTstar are best for near-optimal paths
+  planning_time: 20.0         # Seconds allowed to optimize
+  collision_margin: 0.01      
+  range: 0.05                 # Max step size in joint space (radians)
+  resolution: 0.001          
+  inflation_factor: 1.1          # Inflate obstacles by 20% for safer paths
+  
+  # Restrict base joint (Joint 0) to prevent 360-degree loops
+  joint_0_limit: [-1.57, 1.57] # Forced front-facing only [min, max] in radians
+  spawn_safety_buffer: 0.08
+  # --- NEW: Orientation Constraints ---
+  # Max allowed deviation from "Look Down" during the path (in degrees)
+  max_orientation_deviation: 60.0 
+  
+obstacles:
+  obs1_yaw: 0.785      # 45 degrees
+  obs1_size: [0.02, 0.2, 0.1]
+  num_obstacles: 2           # Number of adversarial obstacles to spawn
+
+smoothing:
+  enable_smoothing: true
+  smooth_steps: 35            # Increased to 25 to act more like a STOMP optimizer
+  interpolate_points: 200    
+  min_change: 0.005          # Stricter convergence for better quality
+
+optimization:
+  # Focus on shortest path + keeping the end-effector level
+  objective: "Multi"     # Options: PathLength, MechanicalWork
+  cost_threshold: 1.1         # Stop planning if path is within 10% of theoretical straight line
