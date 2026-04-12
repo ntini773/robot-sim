@@ -26,7 +26,9 @@ smoothing:
   enable_smoothing: true
   smooth_steps: 35            # Increased to 25 to act more like a STOMP optimizer
   interpolate_points: 200    
+  smooth_with_constant_points: False  # If true, uses fixed interpolate_points; if false, calculates based on path length
   min_change: 0.005          # Stricter convergence for better quality
+  desired_spacing_between_adjacent_waypoints: 0.02      # radians(euclidean joint distance) between waypoints (tune this) , ig KM sir mentioned this in the meeting 
 
 optimization:
   # Focus on shortest path + keeping the end-effector level

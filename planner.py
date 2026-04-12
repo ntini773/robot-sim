@@ -201,15 +201,15 @@ class RobotOMPLPlanner:
         # Save initial robot state to restore after planning
         self.saved_state = None
         
-        print(f"\n{'='*60}")
-        print(f"OMPL PLANNER INITIALIZATION (VISIBLE COLLISION CHECKING)")
-        print(f"{'='*60}")
-        print(f"Robot ID: {robot.id}")
-        print(f"DOF: {self.n_joints}")
-        print(f"Joints: {self.joint_ids}")
-        print(f"Obstacles: {len(self.obstacles)}")
-        print(f"Collision margin: {collision_margin}m")
-        print(f"Note: Robot will be moved during planning for collision checks")
+        # print(f"\n{'='*60}")
+        # print(f"OMPL PLANNER INITIALIZATION (VISIBLE COLLISION CHECKING)")
+        # print(f"{'='*60}")
+        # print(f"Robot ID: {robot.id}")
+        # print(f"DOF: {self.n_joints}")
+        # print(f"Joints: {self.joint_ids}")
+        # print(f"Obstacles: {len(self.obstacles)}")
+        # print(f"Collision margin: {collision_margin}m")
+        # print(f"Note: Robot will be moved during planning for collision checks")
         
         # ============================================
         # OMPL STATE SPACE SETUP
@@ -265,8 +265,6 @@ class RobotOMPLPlanner:
         self.planner = None
         self.planner_type = None
         
-        print(f"✓ OMPL planner initialized (call set_planner() to select algorithm)")
-        print(f"{'='*60}\n")
 
     def is_state_valid(self, state):
         """
@@ -507,9 +505,9 @@ class RobotOMPLPlanner:
         
         self.ss.setStartAndGoalStates(start, goal)
         
-        print(f"\nPlanning with {self.planner_type}...")
-        print(f"  Start: {[f'{x:.2f}' for x in start_config]}")
-        print(f"  Goal:  {[f'{x:.2f}' for x in goal_config]}")
+        # print(f"\nPlanning with {self.planner_type}...")
+        # print(f"  Start: {[f'{x:.2f}' for x in start_config]}")
+        # print(f"  Goal:  {[f'{x:.2f}' for x in goal_config]}")
         
         # Solve
         start_time = time.time()
@@ -521,7 +519,8 @@ class RobotOMPLPlanner:
         # UPDATE 2: Modify the execution block inside the plan() function
         if solved:
             path_obj = self.ss.getSolutionPath()
-            
+
+
             # Check if smoothing is enabled in the config
             if self.config.get('smoothing', {}).get('enable_smoothing', True):
                 ps = og.PathSimplifier(self.ss.getSpaceInformation())
@@ -533,9 +532,18 @@ class RobotOMPLPlanner:
                 
                 ps.smoothBSpline(path_obj, maxSteps=s_steps, minChange=m_change)
             # Read interpolation points
-            i_points = self.config.get('smoothing', {}).get('interpolate_points', 100)
-            path_obj.interpolate(i_points)
-                    
+            if self.config.get('smoothing', {}).get('smooth_with_constant_points', False):
+                i_points = self.config.get('smoothing', {}).get('interpolate_points', 100)
+            else:
+                desired_spacing = self.config.get('smoothing', {}).get('desired_spacing_between_adjacent_waypoints', 0.02)         # radians between waypoints (tune this)
+                path_length = path_obj.length()
+                print(f"  Path length: {path_length:.4f}")
+                if path_length < 0.3:   # too short, robot barely moved
+                    return False, None
+                
+                i_points = max(10, int(path_length / desired_spacing))
+            print(f"  Path length: {path_length:.4f} found in {elapsed:.2f}s, interpolating to {i_points} points for smooth execution")
+            path_obj.interpolate(i_points)                    
             # Convert to list
             path_list = []
             
@@ -562,7 +570,6 @@ class RobotOMPLPlanner:
                 self._restore_robot_state()
                 return False, None
                 
-            print(f"✓ Path found, smoothed, and verified: {len(path_list)} waypoints in {elapsed:.2f}s")
             self._restore_robot_state() 
             return True, path_list
         else:

@@ -14,6 +14,9 @@ import ompl.base as ob
 import ompl.geometric as og
 from planner import RobotOMPLPlanner, solve_ik_collision_free,solve_ik, visualise_eef_traj 
 import test_lite6_ompl
+import shutil as _shutil
+from utils import interactive_camera_helper
+
 CUBE_LENGTH = 0.05
 import yaml
 
@@ -194,7 +197,7 @@ class Lite6Robot:
         self.controllable_joints = []
         for i in range(p.getNumJoints(self.id)):
             info = p.getJointInfo(self.id, i)
-            print(f"Joint {i}: {info[1].decode('utf-8')}, Type: {info[2]}, Limits: [{info[8]}, {info[9]}], MaxForce: {info[10]}, MaxVelocity: {info[11]}")
+            # print(f"Joint {i}: {info[1].decode('utf-8')}, Type: {info[2]}, Limits: [{info[8]}, {info[9]}], MaxForce: {info[10]}, MaxVelocity: {info[11]}")
             jointID = info[0]
             jointName = info[1].decode("utf-8")
             jointType = info[2]
@@ -575,19 +578,19 @@ def create_data_folders_3cam(iter_folder):
 _MP_CAMERAS = [
     {
         "name": "thirdperson_cam00",
-        "eye":    [ 0.70,  0.60, 1.10],
+        "eye":    [0.6294, 0.9766, 1.3748],
         "target": [ 0.20,  0.00, 0.75],
         "up":     [ 0.0,   0.0,  1.0 ],
     },
     {
         "name": "thirdperson_cam01",
-        "eye":    [ 0.70, -0.60, 1.10],
+        "eye":    [0.8562, -0.5951, 1.4672],
         "target": [ 0.20,  0.00, 0.75],
         "up":     [ 0.0,   0.0,  1.0 ],
     },
     {
         "name": "thirdperson_cam02",
-        "eye":    [ 0.25,  0.00, 1.60],
+        "eye":    [-0.0628, 0.0000, 1.9990],
         "target": [ 0.25,  0.00, 0.70],
         "up":     [ 0.0,   1.0,  0.0 ],
     },
@@ -1516,9 +1519,10 @@ def motion_plan_data(
             0.75 + float(np.random.uniform(-0.05, 0.2, size=1)[0]),
         ]
         target_orn = p.getQuaternionFromEuler([-1.5708, 0, 1.5708])
-
-        draw_sphere(point_A_pos, radius=0.02, color=[0, 1, 0])
-        draw_sphere(point_B_pos, radius=0.02, color=[1, 0, 0])
+        # print(f"p.connectionInfo(): {p.getConnectionInfo()}")
+        if p.getConnectionInfo()['connectionMethod'] == 1:  # 1: GUI , 2 : DIRECT3 
+            draw_sphere(point_A_pos, radius=0.02, color=[0, 1, 0])
+            draw_sphere(point_B_pos, radius=0.02, color=[1, 0, 0])
 
         # ------------------------------------------------------------------
         # 2. Spawn obstacles
@@ -1622,14 +1626,16 @@ def motion_plan_data(
 
         # planner._snapshot_gripper_pose()
         # planner._apply_frozen_gripper_printing()
-
-        for i, waypoint in enumerate(path):
+        MAX_STEPS_PER_WAYPOINT = 2   # hard cap — tune this down (e.g. 2-3)
+        WAYPOINT_THRESHOLD = 0.01
+        print(type(path), len(path))
+        for i, waypoint in enumerate(path):  # Skip every other waypoint for faster execution (tune as needed)
             for j, joint_id in enumerate(planner.joint_ids):
                 p.setJointMotorControl2(
                     planner.robot.id, joint_id, p.POSITION_CONTROL,
                     waypoint[j],
                     force=150.0,
-                    maxVelocity=1.5,
+                    maxVelocity=robot.max_velocity,
                     positionGain=0.05,
                     velocityGain=1.0,
                 )
@@ -1637,12 +1643,13 @@ def motion_plan_data(
             eef_state = p.getLinkState(planner.robot.id, planner.robot.eef_id)
             visualise_eef_traj(eef_state[0])
 
-            for _ in range(5):
+            for step in range(MAX_STEPS_PER_WAYPOINT):
                 # planner._apply_frozen_gripper()
 
                 # --- step simulation + capture one frame ---
+                
                 update_simulation(1, robot=robot, **sim_kwargs)
-                p.stepSimulation()
+                # p.stepSimulation()
 
                 # Collision check
                 for obs_id in [table_id] + obstacle_ids:
@@ -1653,9 +1660,8 @@ def motion_plan_data(
                         break
                 if collision_occurred:
                     break
-
                 current = [p.getJointState(robot.id, j)[0] for j in planner.joint_ids]
-                if np.max(np.abs(np.array(current) - np.array(waypoint))) < 0.01:
+                if np.max(np.abs(np.array(current) - np.array(waypoint))) < WAYPOINT_THRESHOLD:
                     break
 
             if collision_occurred:
@@ -1673,7 +1679,14 @@ def motion_plan_data(
         dot      = np.clip(abs(np.dot(final_orn, target_orn)), 0.0, 1.0)
         orn_err  = math.degrees(2.0 * math.acos(dot))
 
-        reached_goal = (not collision_occurred) and (pos_err < 0.05) and (orn_err < 20)
+        reached_goal = (not collision_occurred)
+        # 3. Did the robot actually follow the planned path?
+        # Compare final joint state vs last waypoint of path
+        final_joints = [p.getJointState(robot.id, j)[0] for j in robot.arm_controllable_joints]
+        last_waypoint = np.array(path[-1])
+        tracking_err = np.max(np.abs(np.array(final_joints) - last_waypoint))
+        if tracking_err > 0.15:
+            print(f"⚠️  High tracking error: {tracking_err:.4f} rad — saving anyway")
 
         # ------------------------------------------------------------------
         # 9. Record end configuration
@@ -1687,6 +1700,7 @@ def motion_plan_data(
             "pos_error_m":       float(pos_err),
             "orn_error_deg":     float(orn_err),
             "collision_occurred": collision_occurred,
+            "tracking_err_rad": tracking_err,   # ADDED to filter data
         }
 
         # ------------------------------------------------------------------
@@ -1694,7 +1708,6 @@ def motion_plan_data(
         # ------------------------------------------------------------------
         for obs_id in obstacle_ids:
             p.removeBody(obs_id)
-        planner.cleanup()
 
         if not reached_goal:
             reason = "Collision" if collision_occurred else "Missed Target"
@@ -1714,7 +1727,6 @@ def motion_plan_data(
         print(f"{'='*60}\n")
 
         final_folder = os.path.join(base_save_dir, f"iter_{successful_iterations:04d}")
-        import shutil as _shutil
         if os.path.exists(final_folder):
             _shutil.rmtree(final_folder)
         os.rename(temp_folder, final_folder)
@@ -1831,6 +1843,7 @@ def motion_plan_data(
             "final_eef_pos":      list(final_pos),
             "pos_error_m":        float(pos_err),
             "orn_error_deg":      float(orn_err),
+            "tracking_err_rad": tracking_err,   # ADDED
             "cameras":            [c["name"] for c in _MP_CAMERAS],
             "state_description":  {"arm_joints": [0,1,2,3,4,5], "gripper": [6]},
             "action_description": "Absolute target state (next state) for each timestep",
@@ -1894,10 +1907,11 @@ def main():
     Or else False to include table in point clouds
     """
 
-    _, table_id, plane_id = setup_simulation(freq=60, gui=True)
+    _, table_id, plane_id = setup_simulation(freq=60, gui=False)
     robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
     robot_urdf_path = robot.urdf_path
     robot.load()
+    # interactive_camera_helper()
     tcp_link_index = -1
     for i in range(p.getNumJoints(robot.id)):
         joint_info = p.getJointInfo(robot.id, i)
