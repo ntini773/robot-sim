@@ -902,23 +902,30 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
 
         eef_state = robot.get_current_ee_position()
         eef_orientation = eef_state[1]
+        config_dict = {
+            'planner': {'algorithm': 'RRTConnect', 'planning_time': 5.0, 'collision_margin': 0.02, 'resolution': 0.005},
+            'smoothing': {'enable_smoothing': True, 'smooth_steps': 10, 'interpolate_points': 150, 'min_change': 0.01},
+            'optimization': {'objective': "PathLength", 'cost_threshold': 1.1}
+        }
         planner1 = RobotOMPLPlanner(
         robot=robot,
         robot_urdf="./lite-6-updated-urdf/lite_6_new.urdf",
         obstacles=[table_id,cube_id],
         collision_margin=0.02,
-        ignore_base=True
+        ignore_base=True,
+        config=config_dict
         )
-        planner1.set_planner("AITStar")
+        planner1.set_planner(config_dict["planner"].get('algorithm', 'AITstar'))
 
         planner2 = RobotOMPLPlanner(
         robot=robot,
         robot_urdf="./lite-6-updated-urdf/lite_6_new.urdf",
         obstacles=[table_id,cylinder_id],
         collision_margin=0.02,
-        ignore_base=True
+        ignore_base=True,
+        config=config_dict
         )
-        planner2.set_planner("AITStar")
+        planner2.set_planner(config_dict["planner"].get('algorithm', 'AITstar'))
 
         # Phase 1: Move above cube
         print("Phase 1: Moving above cube...")
