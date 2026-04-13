@@ -7,3 +7,8 @@ See config/planner_config.yaml for the configuration file that defines the param
 
 In motion_planning_lite6.py, I have 2 sets of obstacle setups , 
 see `generate_task_obstacles_old` and `generate_task_obstacles` in the function motion_plan_data in these files.
+
+
+For Generating simulation data, run motion_planning_lite6_data.py and using the environment sim 
+For generating zarr , run create_motion_planning_zarr.py and using environment sim_cam 
+
