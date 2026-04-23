@@ -45,7 +45,14 @@ from tqdm import tqdm
 DATA_ROOT = "./dataset_mp"
 OUT_ZARR = "./rrc_sim_dataset_mp.zarr"
 CHUNK_SIZE = 100
-CAMERAS = ("thirdperson_cam00", "thirdperson_cam01", "thirdperson_cam02")
+# Set to True for the 3-camera layout produced by motion_plan_data().
+# Set to False for the single-camera layout produced by the grab-cube collector.
+USE_3CAM = False
+CAMERAS = (
+    ("thirdperson_cam00", "thirdperson_cam01", "thirdperson_cam02")
+    if USE_3CAM
+    else ("tp",)
+)
 TARGET_MERGED_POINTS = 5000
 # Set to None to include all episodes, or a float (radians) to keep only episodes <= threshold.
 TRACKING_ERROR_MAX_RAD = None
@@ -190,21 +197,42 @@ def process_episode(traj_dir: str, traj_name: str) -> Optional[dict]:
     rgb_files_by_cam: Dict[str, List[str]] = {}
     pcd_files_by_cam: Dict[str, List[str]] = {}
 
-    for cam in CAMERAS:
-        rgb_dir = os.path.join(traj_dir, cam, "rgb")
-        pcd_dir = os.path.join(traj_dir, cam, "pcd")
+    if USE_3CAM:
+        for cam in CAMERAS:
+            rgb_dir = os.path.join(traj_dir, cam, "rgb")
+            pcd_dir = os.path.join(traj_dir, cam, "pcd")
+            if not os.path.isdir(rgb_dir) or not os.path.isdir(pcd_dir):
+                print(f"  Skipping {traj_name}: missing rgb/pcd folder for {cam}")
+                return None
+
+            rgb_files = sorted_files(rgb_dir, ".png")
+            pcd_files = sorted_files(pcd_dir, ".npy")
+
+            if len(rgb_files) != num_states:
+                print(f"  Skipping {traj_name}: {cam} rgb count {len(rgb_files)} != states {num_states}")
+                return None
+            if len(pcd_files) != num_states:
+                print(f"  Skipping {traj_name}: {cam} pcd count {len(pcd_files)} != states {num_states}")
+                return None
+
+            rgb_files_by_cam[cam] = rgb_files
+            pcd_files_by_cam[cam] = pcd_files
+    else:
+        cam = CAMERAS[0]
+        rgb_dir = os.path.join(traj_dir, "third_person", "rgb")
+        pcd_dir = os.path.join(traj_dir, "third_person", "pcd")
         if not os.path.isdir(rgb_dir) or not os.path.isdir(pcd_dir):
-            print(f"  Skipping {traj_name}: missing rgb/pcd folder for {cam}")
+            print(f"  Skipping {traj_name}: missing third_person/rgb or third_person/pcd")
             return None
 
         rgb_files = sorted_files(rgb_dir, ".png")
         pcd_files = sorted_files(pcd_dir, ".npy")
 
         if len(rgb_files) != num_states:
-            print(f"  Skipping {traj_name}: {cam} rgb count {len(rgb_files)} != states {num_states}")
+            print(f"  Skipping {traj_name}: rgb count {len(rgb_files)} != states {num_states}")
             return None
         if len(pcd_files) != num_states:
-            print(f"  Skipping {traj_name}: {cam} pcd count {len(pcd_files)} != states {num_states}")
+            print(f"  Skipping {traj_name}: pcd count {len(pcd_files)} != states {num_states}")
             return None
 
         rgb_files_by_cam[cam] = rgb_files
@@ -218,8 +246,12 @@ def process_episode(traj_dir: str, traj_name: str) -> Optional[dict]:
         frame_pcs = []
 
         for cam in CAMERAS:
-            rgb_path = os.path.join(traj_dir, cam, "rgb", rgb_files_by_cam[cam][i])
-            pcd_path = os.path.join(traj_dir, cam, "pcd", pcd_files_by_cam[cam][i])
+            if USE_3CAM:
+                rgb_path = os.path.join(traj_dir, cam, "rgb", rgb_files_by_cam[cam][i])
+                pcd_path = os.path.join(traj_dir, cam, "pcd", pcd_files_by_cam[cam][i])
+            else:
+                rgb_path = os.path.join(traj_dir, "third_person", "rgb", rgb_files_by_cam[cam][i])
+                pcd_path = os.path.join(traj_dir, "third_person", "pcd", pcd_files_by_cam[cam][i])
 
             img = np.array(Image.open(rgb_path), dtype=np.uint8)
             pc = np.load(pcd_path).astype(np.float32, copy=False)
@@ -231,8 +263,13 @@ def process_episode(traj_dir: str, traj_name: str) -> Optional[dict]:
             local_imgs[cam].append(img)
             frame_imgs.append(img)
             frame_pcs.append(pc)
-        merged_pc = np.concatenate(frame_pcs, axis=0).astype(np.float32, copy=False)
-        merged_pc = normalize_merged_point_cloud(merged_pc, TARGET_MERGED_POINTS)
+
+        if USE_3CAM:
+            merged_pc = np.concatenate(frame_pcs, axis=0).astype(np.float32, copy=False)
+            merged_pc = normalize_merged_point_cloud(merged_pc, TARGET_MERGED_POINTS)
+        else:
+            merged_pc = frame_pcs[0].astype(np.float32, copy=False)
+
         local_pcs.append(merged_pc)
 
     pose_summary = load_camera_pose_summary(traj_dir)
@@ -355,7 +392,7 @@ def main() -> None:
     meta = zroot.create_group("meta")
 
     for cam in CAMERAS:
-        key = cam.replace("thirdperson_", "img_")
+        key = cam.replace("thirdperson_", "img_") if USE_3CAM else "img"
         data.create_dataset(key,data=imgs_stacked[cam],chunks=(CHUNK_SIZE, *imgs_stacked[cam].shape[1:]),dtype="uint8",compressor=compressor,)
 
     data.create_dataset("point_cloud",data=pcs_stacked,chunks=(CHUNK_SIZE, *pcs_stacked.shape[1:]),dtype="float32",compressor=compressor,)
@@ -409,6 +446,7 @@ def main() -> None:
     zroot.attrs["schema_version"] = "motion_planning_multiview_v1"
     zroot.attrs["source_dataset"] = DATA_ROOT
     zroot.attrs["camera_names"] = list(CAMERAS)
+    zroot.attrs["use_3cam"] = USE_3CAM
     zroot.attrs["episode_names"] = episode_names
     zroot.attrs["description"] = (
         "Multi-view motion-planning dataset. Three synchronized RGB views are stored "
