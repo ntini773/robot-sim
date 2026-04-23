@@ -42,7 +42,7 @@ from PIL import Image
 from tqdm import tqdm
 
 # CONFIG
-DATA_ROOT = "./dataset_mp"
+DATA_ROOT = "./dataset_mp_poco"
 OUT_ZARR = "./rrc_sim_dataset_mp.zarr"
 CHUNK_SIZE = 100
 # Set to True for the 3-camera layout produced by motion_plan_data().
@@ -269,6 +269,7 @@ def process_episode(traj_dir: str, traj_name: str) -> Optional[dict]:
             merged_pc = normalize_merged_point_cloud(merged_pc, TARGET_MERGED_POINTS)
         else:
             merged_pc = frame_pcs[0].astype(np.float32, copy=False)
+            TARGET_MERGED_POINTS = merged_pc.shape[0]
 
         local_pcs.append(merged_pc)
 
