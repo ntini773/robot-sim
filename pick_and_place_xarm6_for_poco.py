@@ -576,9 +576,15 @@ def update_simulation(
     # Camera pose from real-world calibration (base-to-camera transform)
     # Translation in base frame: [0.7463, 0.3093, 0.5574]
     # Robot base is at z=0.62 in world frame
-    tp_cam_eye = [0.7463, 0.3093, 0.62 + 0.5574]  # [0.7463, 0.3093, 1.1774]
-    # Viewing direction from 3rd column of rotation: [-0.7751, -0.4045, -0.4855]
-    tp_cam_target = [0.7463 - 0.7751, 0.3093 - 0.4045, 1.1774 - 0.4855]  # [-0.0288, -0.0952, 0.6919]
+    eye = np.array([0.7463, 0.3093, 1.1774])
+    direction = np.array([-0.7751, -0.4045, -0.4855])
+    direction = direction / np.linalg.norm(direction)
+    # tp_cam_eye = [0.7463, 0.3093, 0.62 + 0.5574]  # [0.7463, 0.3093, 1.1774]
+    # # Viewing direction from 3rd column of rotation: [-0.7751, -0.4045, -0.4855]
+    # tp_cam_target = [0.7463 - 0.7751, 0.3093 - 0.4045, 1.1774 - 0.4855]  # [-0.0288, -0.0952, 0.6919]
+    # tp_cam_up = [0, 0, 1]
+    tp_cam_eye = (eye - 0.2 * direction).tolist()
+    tp_cam_target = (tp_cam_eye + 1.0 * direction).tolist()
     tp_cam_up = [0, 0, 1]
 
     # Create list of object IDs to exclude from point clouds
@@ -836,7 +842,11 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         # Spawn cylinder at a random position on the table for this trajectory
         target_radius = 0.05  # 10cm diameter
         target_height = 0.04  # 4cm height
-        tray_pos = [random.uniform(0.20, 0.35), random.uniform(0.15, 0.25), 0.625]
+        # tray_pos = [random.uniform(0.20, 0.35), random.uniform(0.15, 0.25), 0.625]
+        const_x_pos = 0.30
+        const_y_pos = 0.20
+        const_z_pos = 0.625
+        tray_pos = [const_x_pos, const_y_pos, const_z_pos]
         cylinder_id = create_cylinder(target_radius, target_height, tray_pos, color=[1, 0.5, 0, 1])
         print(f"Cylinder spawned at: [{tray_pos[0]:.4f}, {tray_pos[1]:.4f}, {tray_pos[2]:.4f}]")
 
@@ -856,7 +866,9 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         print(f"Robot reset complete. Gripper pos: {actual_pos:.4f}\n")
 
         # Spawn random cube
-        cube_start_pos = [random.uniform(0.15, 0.35), random.uniform(-0.2, 0.1), 0.65]
+        # cube_start_pos = [random.uniform(0.15, 0.35), random.uniform(-0.2, 0.1), 0.65]
+        cube_start_pos = [const_x_pos, -const_y_pos, 0.65]
+        print(f"Y distance between cube and cylinder: {abs(cube_start_pos[1] - tray_pos[1]):.4f}m")
         cube_start_orn = p.getQuaternionFromEuler([0, 0, 0])
         cube_id = p.loadURDF("cube_small.urdf", cube_start_pos, cube_start_orn)
         # Increase friction of the cube itself
@@ -872,7 +884,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         # Phase 1: Move above cube
         print("Phase 1: Moving above cube...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.92], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -908,7 +920,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         # Phase 4: Lift cube
         print("Phase 4: Lifting cube...")
         move_to_pose_dynamic(
-            robot, [cube_start_pos[0], cube_start_pos[1], 1.00], eef_orientation,
+            robot, [cube_start_pos[0], cube_start_pos[1], 0.90], eef_orientation,
             capture_frames=True, iter_folder=temp_folder,
             frame_counter=frame_counter, base_pos=robot.base_pos,
             state_history=state_history, cube_id=cube_id,
@@ -921,7 +933,7 @@ def move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE, base_save_dir="
         print("Phase 5: Moving above cylinder target...")
         # Target the top of the cylinder [0.3, 0.3, 0.625 + 0.04] + half cube height [0.025] + safety margin
         cylinder_height = 0.04
-        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.22]
+        target_drop_pos = [tray_pos[0], tray_pos[1], tray_pos[2] + cylinder_height + CUBE_LENGTH/2 + 0.21]
         print(f"  Target position: [{target_drop_pos[0]:.4f}, {target_drop_pos[1]:.4f}, {target_drop_pos[2]:.4f}]")
 
         move_to_pose_dynamic(
@@ -1157,7 +1169,7 @@ def main():
     _, table_id, plane_id = setup_simulation(freq=60, gui=True)
     robot = Lite6Robot([0, 0, 0.62], [0, 0, 0])
     robot.load()
-    move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE=EXCLUDE_TABLE)
+    move_and_grab_cube(robot, table_id, plane_id, EXCLUDE_TABLE=EXCLUDE_TABLE,base_save_dir="dataset_pick_place_poco")
 
 
 if __name__ == "__main__":

@@ -27,8 +27,8 @@ from PIL import Image
 from tqdm import tqdm
 
 # ── paths ────────────────────────────────────────────────────────────────────
-DATA_ROOT = "/Users/darshiljariwala/Desktop/Robot-Sim/pybullet/old_setup/dataset"
-OUT_ZARR  = "/Users/darshiljariwala/Desktop/Robot-Sim/pybullet/old_setup/rrc_sim_dataset.zarr"
+DATA_ROOT = "/home/nitin/Desktop/Research/robot-sim/dataset2"
+OUT_ZARR  = "/home/nitin/Desktop/Research/robot-sim/rrc_sim_dataset.zarr"
 
 CHUNK_SIZE = 100  # samples per Zarr chunk
 
